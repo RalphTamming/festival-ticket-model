@@ -105,34 +105,63 @@ def _run_step1_events(listing_url: str, *, limit_events: int, headless: bool) ->
 
 
 def _discover_with_retry(event_url: str, *, headed: bool, debug: bool) -> tuple[Step2Result, int, Optional[str]]:
+    return _discover_with_retry_tuned(
+        event_url,
+        headed=headed,
+        debug=debug,
+        retries=1,
+        blocked_sleep_min=2,
+        blocked_sleep_max=5,
+        page_timeout_ms=45_000,
+        pre_network_wait_ms=1500,
+        post_network_wait_ms=2500,
+    )
+
+
+def _discover_with_retry_tuned(
+    event_url: str,
+    *,
+    headed: bool,
+    debug: bool,
+    retries: int,
+    blocked_sleep_min: int,
+    blocked_sleep_max: int,
+    page_timeout_ms: int,
+    pre_network_wait_ms: int,
+    post_network_wait_ms: int,
+) -> tuple[Step2Result, int, Optional[str]]:
     last: Optional[Step2Result] = None
     err_detail: Optional[str] = None
-    for attempt in range(2):
+    total_attempts = max(1, int(retries) + 1)
+    for attempt in range(total_attempts):
         if attempt:
-            _jitter(2.0, 5.0)
+            _jitter(float(blocked_sleep_min), float(max(blocked_sleep_min, blocked_sleep_max)))
         try:
             res = discover_ticket_urls_from_event_playwright(
                 event_url,
                 headed=bool(headed),
                 debug=bool(debug),
                 db_fallback=True,
+                page_timeout_ms=int(page_timeout_ms),
+                pre_network_wait_ms=int(pre_network_wait_ms),
+                post_network_wait_ms=int(post_network_wait_ms),
             )
         except Exception as e:
             err_detail = f"{type(e).__name__}: {e}"
-            if attempt == 0:
+            if attempt < total_attempts - 1:
                 continue
             ev = du.normalize_url(event_url) or event_url
             return Step2Result(ev, "error", False, "none", [], debug_dir=None), attempt + 1, err_detail
         last = res
         if res.status == "ok" and res.ticket_urls:
             return res, attempt + 1, None
-        if res.status == "blocked" and attempt == 0:
+        if res.status == "blocked" and attempt < total_attempts - 1:
             continue
-        if res.status == "no_data" and attempt == 0 and headed:
+        if res.status == "no_data" and attempt < total_attempts - 1 and headed:
             continue
         return res, attempt + 1, None
     assert last is not None
-    return last, 2, err_detail
+    return last, total_attempts, err_detail
 
 
 def _scrape_with_retry(
@@ -313,6 +342,18 @@ def run_discovery_mode(args: Any) -> int:
     db.init_db(conn)
     run_id = db.create_pipeline_run(conn, mode="discovery", scope=scope_name)
     blocked_count = 0
+    blocked_consecutive = 0
+    stopped_early_blocked = False
+    stop_threshold = int(getattr(args, "step2_blocked_stop_threshold", 3))
+    retries = int(getattr(args, "step2_retries", 1))
+    blocked_sleep_min = int(getattr(args, "step2_blocked_sleep_min", 30))
+    blocked_sleep_max = int(getattr(args, "step2_blocked_sleep_max", 90))
+    safe_mode = bool(getattr(args, "vps_safe_mode", False))
+    page_timeout_ms = 75_000 if safe_mode else 45_000
+    pre_network_wait_ms = 3000 if safe_mode else 1500
+    post_network_wait_ms = 5000 if safe_mode else 2500
+    inter_event_min = 2.0 if safe_mode else 0.2
+    inter_event_max = 6.0 if safe_mode else 1.0
     counts: dict[str, int] = {
         "listing_urls": len(listing_urls),
         "events_collected": 0,
@@ -321,6 +362,8 @@ def run_discovery_mode(args: Any) -> int:
         "ticket_types_upserted": 0,
         "step2_blocked": 0,
         "step2_errors": 0,
+        "step2_db_fallback_due_to_block": 0,
+        "stopped_early_blocked": 0,
     }
     try:
         for listing_url in listing_urls:
@@ -328,12 +371,27 @@ def run_discovery_mode(args: Any) -> int:
             counts["events_collected"] += len(events)
             for ev in events:
                 slug = _event_slug(ev)
-                step2, _, _ = _discover_with_retry(ev, headed=bool(args.headed), debug=bool(args.debug))
+                _jitter(inter_event_min, inter_event_max)
+                step2, _, _ = _discover_with_retry_tuned(
+                    ev,
+                    headed=bool(args.headed),
+                    debug=bool(args.debug),
+                    retries=retries,
+                    blocked_sleep_min=blocked_sleep_min,
+                    blocked_sleep_max=blocked_sleep_max,
+                    page_timeout_ms=page_timeout_ms,
+                    pre_network_wait_ms=pre_network_wait_ms,
+                    post_network_wait_ms=post_network_wait_ms,
+                )
                 if step2.status == "blocked":
                     blocked_count += 1
                     counts["step2_blocked"] += 1
+                    blocked_consecutive += 1
                 elif step2.status == "error":
                     counts["step2_errors"] += 1
+                    blocked_consecutive = 0
+                else:
+                    blocked_consecutive = 0
                 event_id = db.upsert_event_record(
                     conn,
                     event_url=ev,
@@ -347,7 +405,17 @@ def run_discovery_mode(args: Any) -> int:
                     status="active",
                 )
                 counts["events_upserted"] += 1
-                for tu in step2.ticket_urls:
+                ticket_urls_for_event = list(step2.ticket_urls)
+                strategy = step2.strategy
+                if step2.status == "blocked" and not ticket_urls_for_event:
+                    known = db.list_ticket_urls_for_event(conn, event_url=ev)
+                    if known:
+                        ticket_urls_for_event = known
+                        strategy = "db_fallback_due_to_block"
+                        counts["step2_db_fallback_due_to_block"] += 1
+                        logging.warning("STEP2 blocked for %s; reusing %d DB ticket URLs", ev, len(ticket_urls_for_event))
+
+                for tu in ticket_urls_for_event:
                     t_slug, t_label = du.ticket_type_from_ticket_url(tu)
                     db.upsert_ticket_type_record(
                         conn,
@@ -360,18 +428,40 @@ def run_discovery_mode(args: Any) -> int:
                     )
                     counts["ticket_types_seen"] += 1
                     counts["ticket_types_upserted"] += 1
+                if blocked_consecutive > stop_threshold:
+                    stopped_early_blocked = True
+                    counts["stopped_early_blocked"] = 1
+                    logging.warning(
+                        "Stopping discovery early due to consecutive verification blocks (%d > %d)",
+                        blocked_consecutive,
+                        stop_threshold,
+                    )
+                    break
+            if stopped_early_blocked:
+                break
 
         paths = _export_mode_csvs(conn, Path("data/outputs"))
-        db.finish_pipeline_run(conn, run_id=run_id, status="ok", counts=counts, error_summary=None)
+        final_status = "ok"
+        if stopped_early_blocked or (counts["step2_blocked"] > 0 and counts["ticket_types_upserted"] == 0):
+            final_status = "verification_blocked_partial"
+        db.finish_pipeline_run(conn, run_id=run_id, status=final_status, counts=counts, error_summary=None)
         _send_telegram(
             f"TicketSwap discovery finished ({scope_name}) events={counts['events_upserted']} "
-            f"ticket_types={counts['ticket_types_upserted']} blocked={counts['step2_blocked']}"
+            f"ticket_types={counts['ticket_types_upserted']} blocked={counts['step2_blocked']} status={final_status}"
         )
         if blocked_count >= 5:
             _send_telegram(f"TicketSwap warning: verification_blocked occurred {blocked_count} times in discovery run.")
-        print(json.dumps({"run_id": run_id, "mode": "discovery", "status": "ok", "counts": counts}, indent=2))
+        if stopped_early_blocked:
+            _send_telegram(
+                f"TicketSwap discovery stopped early on VPS due to consecutive step2 blocks ({blocked_consecutive})."
+            )
+        elif final_status == "verification_blocked_partial":
+            _send_telegram(
+                "TicketSwap discovery ended with verification_blocked_partial (no new ticket types discovered)."
+            )
+        print(json.dumps({"run_id": run_id, "mode": "discovery", "status": final_status, "counts": counts}, indent=2))
         print(f"CSV exports: {', '.join(str(p) for p in paths.values())}")
-        return 0
+        return 3 if stopped_early_blocked else 0
     except Exception as exc:
         db.finish_pipeline_run(conn, run_id=run_id, status="failed", counts=counts, error_summary=str(exc))
         _send_telegram(f"TicketSwap discovery failed ({scope_name}): {exc}")

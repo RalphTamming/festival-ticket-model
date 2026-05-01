@@ -1,8 +1,9 @@
 selenium
-undetected-chromedriver
+undetected-chromedriver==3.5.5
 pandas
 requests
 python-dotenv
 beautifulsoup4
 playwright
 apscheduler
+setuptools

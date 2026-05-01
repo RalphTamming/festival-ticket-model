@@ -160,6 +160,9 @@ def discover_ticket_urls_from_event_playwright(
     headed: bool,
     debug: bool,
     db_fallback: bool,
+    page_timeout_ms: int = 45_000,
+    pre_network_wait_ms: int = 1500,
+    post_network_wait_ms: int = 2500,
 ) -> Step2Result:
     ev = du.normalize_url(event_url) or event_url
     debug_dir = None
@@ -203,6 +206,8 @@ def discover_ticket_urls_from_event_playwright(
             browser = p.chromium.launch(headless=not headed, channel="chrome")
             context = browser.new_context()
             page = context.new_page()
+        page.set_default_navigation_timeout(int(page_timeout_ms))
+        page.set_default_timeout(int(page_timeout_ms))
 
         captured: list[dict[str, Any]] = []
         json_hits: list[str] = []
@@ -255,7 +260,7 @@ def discover_ticket_urls_from_event_playwright(
 
         try:
             page.goto(ev, wait_until="domcontentloaded")
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(int(pre_network_wait_ms))
             body_text = ""
             try:
                 body_text = page.locator("body").inner_text(timeout=2000)
@@ -291,7 +296,7 @@ def discover_ticket_urls_from_event_playwright(
                 return Step2Result(ev, "ok", bool(verification), "embedded_json", static_ticket_urls, debug_dir=debug_dir)
 
             # Strategy C: network interception
-            page.wait_for_timeout(2500)
+            page.wait_for_timeout(int(post_network_wait_ms))
             found: set[str] = set()
             snippets: list[dict[str, Any]] = []
             for item in captured:

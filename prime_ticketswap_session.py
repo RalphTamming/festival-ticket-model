@@ -18,13 +18,28 @@ After that, discovery and scraping runs can reuse the saved session.
 
 from __future__ import annotations
 
+import argparse
+import contextlib
 import sys
+import time
 
 import config
-import discover_urls as du
+from discovery import discover_urls as du
 
 
-def main() -> int:
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Prime TicketSwap persistent browser profile for VPS verification.")
+    p.add_argument(
+        "--wait-seconds",
+        type=int,
+        default=int(getattr(config, "MANUAL_VERIFY_WAIT_SECONDS", 90)),
+        help="Automatic wait window for manual verification before asking for Enter.",
+    )
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(list(argv or []))
     if not config.USE_PERSISTENT_BROWSER_PROFILE:
         print("Set USE_PERSISTENT_BROWSER_PROFILE = True in config.py first.", file=sys.stderr)
         return 1
@@ -36,22 +51,35 @@ def main() -> int:
     print("")
     print("Log in ONLY in the Chrome window that just opened (not your everyday Chrome).")
     print("If you see a verification / captcha page, complete it in that same window.")
+    print("If verification appears, complete it once, then close browser or press Enter.")
+    print("")
+    print("This script will visit:")
+    print("  1) https://www.ticketswap.com/")
+    print("  2) https://www.ticketswap.com/festival-tickets?slug=festival-tickets&location=3")
     print("")
 
     driver = du.new_driver(headless=False)
     try:
         driver.set_page_load_timeout(120)
-        driver.maximize_window()
+        # Xvfb/remote sessions may fail on maximize; keep priming resilient.
+        with contextlib.suppress(Exception):
+            driver.maximize_window()
+        with contextlib.suppress(Exception):
+            driver.set_window_size(1366, 900)
         driver.get("https://www.ticketswap.com/")
-        input("When you are logged in on TicketSwap in that browser window, press Enter here to save and close… ")
+        time.sleep(3)
+        driver.get("https://www.ticketswap.com/festival-tickets?slug=festival-tickets&location=3")
+        print(f"Waiting {args.wait_seconds}s for manual verification/login in the opened browser...")
+        time.sleep(max(0, int(args.wait_seconds)))
+        input("When verification/login is complete, press Enter here to save and close browser... ")
     finally:
         driver.quit()
 
     print("")
     print(f"Done. Session data is stored under: {profile}")
-    print("You can run discover_urls, scrape_market, or run_full_test.py next.")
+    print("You can run discovery/monitoring with run_pipeline.py next.")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

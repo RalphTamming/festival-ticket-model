@@ -94,7 +94,7 @@ mkdir -p logs data/outputs data/debug data/backups
 Discovery:
 
 ```bash
-xvfb-run -a python run_pipeline.py --mode discovery --scope amsterdam_festivals --headed --limit-events 3
+xvfb-run -a python run_pipeline.py --mode discovery --scope amsterdam_festivals --headed --limit-events 3 --vps-safe-mode --step2-retries 2
 ```
 
 Monitoring:
@@ -117,7 +117,28 @@ or headful under virtual display:
 xvfb-run -a python prime_ticketswap_session.py
 ```
 
+Alternative without xvfb (for visible desktop/VNC sessions):
+
+```bash
+python prime_ticketswap_session.py
+```
+
 Notes:
 - VPS traffic can trigger verification more often than a local laptop.
 - Keep persistent profile enabled and use conservative limits.
 - Monitoring runs hourly from cron, but Python still decides what is truly due.
+- Manual commands print to terminal; `scripts/run_discovery.sh` and `scripts/run_monitoring.sh` write to log files.
+
+## Troubleshooting
+
+If you see:
+
+`ModuleNotFoundError: No module named 'distutils'`
+
+This can happen on Python 3.12+ when compatibility shims are missing. Run:
+
+```bash
+source .venv/bin/activate
+pip install setuptools
+pip install -r requirements.txt
+```

@@ -70,6 +70,31 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=False,
         help="Monitoring mode only: continue scraping after event date.",
     )
+    p.add_argument("--step2-retries", type=int, default=1, help="Discovery mode: retries after first STEP2 attempt.")
+    p.add_argument(
+        "--step2-blocked-sleep-min",
+        type=int,
+        default=30,
+        help="Discovery mode: min seconds to sleep before retrying blocked STEP2.",
+    )
+    p.add_argument(
+        "--step2-blocked-sleep-max",
+        type=int,
+        default=90,
+        help="Discovery mode: max seconds to sleep before retrying blocked STEP2.",
+    )
+    p.add_argument(
+        "--step2-blocked-stop-threshold",
+        type=int,
+        default=3,
+        help="Discovery mode: stop early after more than this many consecutive blocked STEP2 events.",
+    )
+    p.add_argument(
+        "--vps-safe-mode",
+        action="store_true",
+        default=False,
+        help="Discovery mode: use slower timings and stronger anti-block behavior for VPS runs.",
+    )
     p.add_argument(
         "--out",
         default="data/outputs/pipeline_run.jsonl",

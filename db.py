@@ -836,6 +836,36 @@ def list_ticket_types_for_monitoring(conn: sqlite3.Connection, *, limit: Optiona
     return conn.execute(sql + " LIMIT ?", (int(limit),)).fetchall()
 
 
+def list_ticket_urls_for_event(conn: sqlite3.Connection, *, event_url: str) -> list[str]:
+    """
+    Read known ticket URLs for an event from both new and legacy tables.
+    """
+    out: list[str] = []
+    rows = conn.execute(
+        """
+        SELECT ticket_url
+        FROM ticket_types
+        WHERE event_url = ? AND status = 'active'
+        ORDER BY ticket_type_id
+        """,
+        (event_url,),
+    ).fetchall()
+    out.extend([str(r["ticket_url"]) for r in rows if r and r["ticket_url"]])
+    if not out:
+        rows_old = conn.execute(
+            """
+            SELECT ticket_url
+            FROM ticket_urls
+            WHERE event_url = ? AND is_active = 1
+            ORDER BY ticket_url_id
+            """,
+            (event_url,),
+        ).fetchall()
+        out.extend([str(r["ticket_url"]) for r in rows_old if r and r["ticket_url"]])
+    # de-dup while preserving order
+    return list(dict.fromkeys(out))
+
+
 def latest_snapshot_for_ticket_type(conn: sqlite3.Connection, ticket_type_id: int) -> Optional[sqlite3.Row]:
     return conn.execute(
         """
