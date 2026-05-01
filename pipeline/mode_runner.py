@@ -411,8 +411,11 @@ def _ticket_due_now(
     now_local: datetime,
     tz: ZoneInfo,
     monitor_after_event: bool,
+    monitor_start_hour: int,
+    monitor_end_hour: int,
 ) -> tuple[bool, str]:
-    if now_local.hour < 8 or now_local.hour >= 24:
+    # inclusive bounds: MONITOR_START_HOUR..MONITOR_END_HOUR
+    if now_local.hour < monitor_start_hour or now_local.hour > monitor_end_hour:
         return False, "outside_window"
     if not event_date_local:
         return True, "missing_event_date"
@@ -456,6 +459,8 @@ def run_monitoring_mode(args: Any) -> int:
     }
     blocked_count = 0
     monitor_after_event = bool(args.monitor_after_event) or bool(getattr(config, "MONITOR_AFTER_EVENT", False))
+    monitor_start_hour = int(getattr(config, "MONITOR_START_HOUR", 8))
+    monitor_end_hour = int(getattr(config, "MONITOR_END_HOUR", 23))
     try:
         rows = db.list_ticket_types_for_monitoring(conn, limit=None)
         counts["ticket_types_loaded"] = len(rows)
@@ -469,6 +474,8 @@ def run_monitoring_mode(args: Any) -> int:
                 now_local=now_local,
                 tz=tz,
                 monitor_after_event=monitor_after_event,
+                monitor_start_hour=monitor_start_hour,
+                monitor_end_hour=monitor_end_hour,
             )
             if due:
                 due_rows.append(r)

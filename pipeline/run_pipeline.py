@@ -44,7 +44,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         choices=["legacy", "discovery", "monitoring"],
         help="legacy = old full pipeline, discovery = collect events/ticket types, monitoring = scrape due ticket types",
     )
-    p.add_argument("--scope", default="amsterdam_festivals", help="Scope key in config.SCOPES (discovery mode).")
+    p.add_argument(
+        "--scope",
+        default=getattr(config, "DEFAULT_SCOPE", "amsterdam_festivals"),
+        help="Scope key in config.SCOPES (discovery mode).",
+    )
     p.add_argument(
         "--listing-url",
         default="https://www.ticketswap.com/festival-tickets?slug=festival-tickets&location=3",

@@ -6,20 +6,28 @@ This repo intentionally keeps configuration simple: edit this file or pass CLI f
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Optional
 
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - optional at runtime before deps install
+    load_dotenv = None
+
+if load_dotenv is not None:
+    load_dotenv()
+
 
 # --- Storage ---
-DB_PATH = Path("ticketswap.db")
+DB_PATH = Path(os.getenv("DB_PATH", "ticketswap.db"))
 DEBUG_DIR = Path("data/debug")
 
 
 # --- Browser (Selenium + undetected-chromedriver) ---
 # Dedicated Chrome user-data dir (not your personal browser). Keeps TicketSwap login across runs.
 USE_PERSISTENT_BROWSER_PROFILE = True
-BROWSER_PROFILE_DIR = Path(".ticketswap_browser_profile")
+BROWSER_PROFILE_DIR = Path(os.getenv("TICKETSWAP_PROFILE_DIR", ".ticketswap_browser_profile"))
 BROWSER_PROFILE_NAME = "Default"
 
 # Pin to your installed Chrome major when known; avoids UC/Selenium driver mismatch errors.
@@ -73,8 +81,11 @@ FAILURE_BACKOFF_BASE_MINUTES = 10
 FAILURE_BACKOFF_CAP_MINUTES = 6 * 60
 
 # --- New pipeline modes / scopes ---
-LOCAL_TIMEZONE = "Europe/Amsterdam"
-MONITOR_AFTER_EVENT = False
+LOCAL_TIMEZONE = os.getenv("LOCAL_TIMEZONE", "Europe/Amsterdam")
+DEFAULT_SCOPE = os.getenv("DEFAULT_SCOPE", "amsterdam_festivals")
+MONITOR_START_HOUR = int(os.getenv("MONITOR_START_HOUR", "8"))
+MONITOR_END_HOUR = int(os.getenv("MONITOR_END_HOUR", "23"))
+MONITOR_AFTER_EVENT = str(os.getenv("MONITOR_AFTER_EVENT", "false")).lower() in ("1", "true", "yes", "on")
 
 SCOPES: dict[str, dict] = {
     "amsterdam_festivals": {

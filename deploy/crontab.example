@@ -1,0 +1,12 @@
+# Discovery every Sunday at 02:00
+0 2 * * 0 cd /root/festival-ticket-model && bash scripts/run_discovery.sh >> logs/cron_discovery.log 2>&1
+
+# Monitoring every hour from 08:00 to 23:00
+0 8-23 * * * cd /root/festival-ticket-model && bash scripts/run_monitoring.sh >> logs/cron_monitoring.log 2>&1
+
+# Backup daily at 23:50
+50 23 * * * cd /root/festival-ticket-model && bash scripts/backup_data.sh >> logs/cron_backup.log 2>&1
+
+# Note:
+# Monitoring is scheduled hourly here, but the Python pipeline still decides
+# which ticket URLs are actually due based on event date and last snapshot.

@@ -1,3 +1,5 @@
+.env
+.venv/
 .ticketswap_browser_profile/
 __pycache__/
 *.pyc
@@ -6,4 +8,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 data/debug/
+data/backups/
+logs/
 *.log

@@ -56,3 +56,11 @@ python scrape_market.py --url "<ticketswap ticket-type price url>"
 
 - Debug artifacts (HTML / screenshots on failures) go to `./debug/`.
 
+## VPS Deployment
+
+For Hetzner Ubuntu deployment, cron scheduling, backups, and operational commands:
+
+- `deploy/VPS_SETUP.md`
+- `deploy/COMMANDS.md`
+- `deploy/crontab.example`
+
