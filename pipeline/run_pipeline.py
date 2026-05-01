@@ -37,7 +37,7 @@ from scraping import scrape_market as sm
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run TicketSwap pipeline: listing → events → tickets → market snapshots.")
+    p = argparse.ArgumentParser(description="Run TicketSwap pipeline: listing -> events -> tickets -> market snapshots.")
     p.add_argument(
         "--mode",
         default="legacy",
