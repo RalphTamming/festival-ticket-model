@@ -1,0 +1,34 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.venv/
+venv/
+ENV/
+
+.env
+
+# Logs
+logs/
+*.log
+
+# Debug artifacts (HTML/screenshots)
+debug/
+
+# SQLite
+*.sqlite3
+*.db
+data/
+
+# Playwright
+ms-playwright/
+.playwright/
+pw_user_data/
+playwright_state.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+

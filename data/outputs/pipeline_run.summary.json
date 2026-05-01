@@ -1,0 +1,18 @@
+{
+  "type": "pipeline_summary",
+  "total_events_processed": 1,
+  "events_with_ticket_urls": 1,
+  "total_ticket_urls": 7,
+  "total_successful_market_scrapes": 4,
+  "total_failures": 3,
+  "failure_breakdown": {
+    "step2_ok": 1,
+    "step2_blocked": 0,
+    "step2_no_data": 0,
+    "step2_error": 0,
+    "scrape_ok": 4,
+    "scrape_blocked": 0,
+    "scrape_no_data": 3,
+    "scrape_error": 0
+  }
+}
