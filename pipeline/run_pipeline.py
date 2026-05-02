@@ -96,6 +96,30 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Discovery mode: use slower timings and stronger anti-block behavior for VPS runs.",
     )
     p.add_argument(
+        "--step2-browser",
+        choices=["selenium", "playwright", "auto"],
+        default="auto",
+        help="Discovery mode: STEP2 browser strategy preference.",
+    )
+    p.add_argument(
+        "--step2-verification-wait",
+        type=int,
+        default=60,
+        help="Discovery mode: seconds to wait when verification is detected before retry/reload.",
+    )
+    p.add_argument(
+        "--wait-for-manual-verification",
+        action="store_true",
+        default=False,
+        help="Discovery mode: keep STEP2 browser open up to 300s for manual verification recovery.",
+    )
+    p.add_argument(
+        "--require-fresh-step2",
+        action="store_true",
+        default=False,
+        help="Discovery mode: disable DB fallback; fail discovery status if fresh STEP2 is blocked.",
+    )
+    p.add_argument(
         "--out",
         default="data/outputs/pipeline_run.jsonl",
         help="Output JSONL path (parent dirs are created).",

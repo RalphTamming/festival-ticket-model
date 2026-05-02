@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import sys
 import time
+from pathlib import Path
 
 import config
 from discovery import discover_urls as du
@@ -34,6 +36,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=int(getattr(config, "MANUAL_VERIFY_WAIT_SECONDS", 90)),
         help="Automatic wait window for manual verification before asking for Enter.",
+    )
+    p.add_argument(
+        "--manual-timeout",
+        type=int,
+        default=300,
+        help="Maximum seconds to keep browser open for manual verification.",
+    )
+    p.add_argument(
+        "--remote-debugging-port",
+        type=int,
+        default=9222,
+        help="Expose Chrome remote debugging port for SSH tunnel workflows.",
     )
     return p.parse_args(argv)
 
@@ -50,15 +64,26 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  {profile}")
     print("")
     print("Log in ONLY in the Chrome window that just opened (not your everyday Chrome).")
-    print("If you see a verification / captcha page, complete it in that same window.")
-    print("If verification appears, complete it once, then close browser or press Enter.")
+    print("Complete TicketSwap verification manually if shown. Do not close until the real page loads.")
+    print("")
+    print(f"Remote debugging enabled on port {args.remote_debugging_port}.")
+    print("If needed, tunnel from local machine:")
+    print(f"  ssh -L {args.remote_debugging_port}:localhost:{args.remote_debugging_port} root@178.104.249.252")
+    print(f"Then open http://localhost:{args.remote_debugging_port}")
     print("")
     print("This script will visit:")
     print("  1) https://www.ticketswap.com/")
     print("  2) https://www.ticketswap.com/festival-tickets?slug=festival-tickets&location=3")
+    print("  3) https://www.ticketswap.com/festival-tickets/bondgenoten-festival-2026-amsterdam-lofi-2026-05-29-CZrBG4iowfg4JsxTeEx7j")
     print("")
 
-    driver = du.new_driver(headless=False)
+    driver = du.new_driver(
+        headless=False,
+        extra_args=[f"--remote-debugging-port={int(args.remote_debugging_port)}"],
+    )
+    html = ""
+    status = "still_blocked"
+    final_url = ""
     try:
         driver.set_page_load_timeout(120)
         # Xvfb/remote sessions may fail on maximize; keep priming resilient.
@@ -66,17 +91,48 @@ def main(argv: list[str] | None = None) -> int:
             driver.maximize_window()
         with contextlib.suppress(Exception):
             driver.set_window_size(1366, 900)
-        driver.get("https://www.ticketswap.com/")
-        time.sleep(3)
-        driver.get("https://www.ticketswap.com/festival-tickets?slug=festival-tickets&location=3")
-        print(f"Waiting {args.wait_seconds}s for manual verification/login in the opened browser...")
+        urls = [
+            "https://www.ticketswap.com/",
+            "https://www.ticketswap.com/festival-tickets?slug=festival-tickets&location=3",
+            "https://www.ticketswap.com/festival-tickets/bondgenoten-festival-2026-amsterdam-lofi-2026-05-29-CZrBG4iowfg4JsxTeEx7j",
+        ]
+        for u in urls:
+            with contextlib.suppress(Exception):
+                driver.get(u)
+            time.sleep(3)
+
+        print(f"Waiting {args.wait_seconds}s first-pass verification window...")
         time.sleep(max(0, int(args.wait_seconds)))
-        input("When verification/login is complete, press Enter here to save and close browser... ")
+        print(
+            f"Press Enter when real TicketSwap content is visible; "
+            f"auto-timeout in {int(args.manual_timeout)} seconds."
+        )
+        with contextlib.suppress(Exception):
+            import select
+
+            r, _, _ = select.select([sys.stdin], [], [], float(max(0, int(args.manual_timeout))))
+            if r:
+                sys.stdin.readline()
+
+        html = driver.page_source or ""
+        final_url = str(getattr(driver, "current_url", "") or "")
+        if not du.is_blocked_for_discovery(html) and not du.looks_like_verification(html):
+            status = "ok"
     finally:
+        out = Path(config.DEBUG_DIR) / "priming"
+        out.mkdir(parents=True, exist_ok=True)
+        ts = str(int(time.time()))
+        with contextlib.suppress(Exception):
+            (out / f"{ts}_priming_page.html").write_text(html or "", encoding="utf-8")
+        with contextlib.suppress(Exception):
+            driver.save_screenshot(str(out / f"{ts}_priming_screenshot.png"))
         driver.quit()
 
     print("")
     print(f"Done. Session data is stored under: {profile}")
+    print(f"final_url: {final_url}")
+    print(f"priming_status: {status}")
+    print("priming_debug_dir: data/debug/priming")
     print("You can run discovery/monitoring with run_pipeline.py next.")
     return 0
 

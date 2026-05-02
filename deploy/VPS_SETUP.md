@@ -103,6 +103,25 @@ Monitoring:
 xvfb-run -a python run_pipeline.py --mode monitoring --headed --limit-tickets 5
 ```
 
+Focused live STEP2 validation loop:
+
+```bash
+xvfb-run -a bash scripts/test_step2_until_success.sh
+```
+
+Focused single-event live STEP2 test (fresh discovery only):
+
+```bash
+xvfb-run -a python step2_vps_live_test.py \
+  --event-url "https://www.ticketswap.com/festival-tickets/bondgenoten-festival-2026-amsterdam-lofi-2026-05-29-CZrBG4iowfg4JsxTeEx7j" \
+  --browser selenium \
+  --headed \
+  --retries 3 \
+  --verification-wait 120 \
+  --wait-for-manual-verification \
+  --debug
+```
+
 ## J) Verification-block handling / profile priming
 
 If TicketSwap verification blocks more often on VPS, run profile priming:
@@ -122,6 +141,14 @@ Alternative without xvfb (for visible desktop/VNC sessions):
 ```bash
 python prime_ticketswap_session.py
 ```
+
+Optional remote debugging tunnel (best-effort):
+
+```bash
+ssh -L 9222:localhost:9222 root@178.104.249.252
+```
+
+Then open [http://localhost:9222](http://localhost:9222). If you still cannot get visible browser access, use a one-time VNC/noVNC desktop session.
 
 Notes:
 - VPS traffic can trigger verification more often than a local laptop.

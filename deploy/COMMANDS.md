@@ -40,10 +40,43 @@ Alternative when using a visible desktop/VNC:
 python prime_ticketswap_session.py
 ```
 
+Optional remote debugging tunnel:
+
+```bash
+ssh -L 9222:localhost:9222 root@178.104.249.252
+```
+
+Then open [http://localhost:9222](http://localhost:9222).
+
 ## Run discovery test
 
 ```bash
 xvfb-run -a python run_pipeline.py --mode discovery --scope amsterdam_festivals --headed --limit-events 3 --vps-safe-mode --step2-retries 2
+```
+
+## Run focused STEP2 live loop test
+
+```bash
+xvfb-run -a bash scripts/test_step2_until_success.sh
+```
+
+## Run focused single-event STEP2 live test
+
+```bash
+xvfb-run -a python step2_vps_live_test.py \
+  --event-url "https://www.ticketswap.com/festival-tickets/bondgenoten-festival-2026-amsterdam-lofi-2026-05-29-CZrBG4iowfg4JsxTeEx7j" \
+  --browser selenium \
+  --headed \
+  --retries 3 \
+  --verification-wait 120 \
+  --wait-for-manual-verification \
+  --debug
+```
+
+## Run discovery with explicit Selenium-first STEP2
+
+```bash
+xvfb-run -a python run_pipeline.py --mode discovery --scope amsterdam_festivals --headed --limit-events 3 --vps-safe-mode --step2-browser selenium --step2-retries 3 --step2-verification-wait 60 --wait-for-manual-verification --require-fresh-step2
 ```
 
 ## Run monitoring test

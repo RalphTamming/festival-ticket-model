@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import json
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -51,8 +53,8 @@ class Step2Result:
     debug_dir: Optional[str] = None
 
 
-def _ensure_debug_dir() -> Path:
-    d = Path(config.DEBUG_DIR) / "step2"
+def _ensure_debug_dir(debug_root: str = "step2") -> Path:
+    d = Path(config.DEBUG_DIR) / debug_root
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -84,6 +86,38 @@ def _guess_hub_slug_from_event_url(event_url: str) -> str:
     return "-".join(parts[:2]) if len(parts) >= 2 else (parts[0] if parts else "")
 
 
+def _write_step2_artifacts(
+    *,
+    debug_dir: Optional[str],
+    html: str,
+    visible_text: str,
+    current_url: str,
+    browser_strategy: str,
+    extracted_json_snippets: Optional[list[dict[str, Any]]] = None,
+    screenshot_writer: Optional[Any] = None,
+) -> None:
+    if not debug_dir:
+        return
+    d = Path(debug_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(Exception):
+        Path(d, "page.html").write_text(html or "", encoding="utf-8")
+    with contextlib.suppress(Exception):
+        Path(d, "visible_text.txt").write_text(visible_text or "", encoding="utf-8")
+    with contextlib.suppress(Exception):
+        Path(d, "current_url.txt").write_text(current_url or "", encoding="utf-8")
+    with contextlib.suppress(Exception):
+        Path(d, "browser_strategy.txt").write_text(browser_strategy, encoding="utf-8")
+    with contextlib.suppress(Exception):
+        Path(d, "extracted_json_snippets.json").write_text(
+            json.dumps(extracted_json_snippets or [], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    if screenshot_writer is not None:
+        with contextlib.suppress(Exception):
+            screenshot_writer(str(Path(d, "screenshot.png")))
+
+
 def _is_verification_text(text: str) -> bool:
     t = (text or "").lower()
     return "unable to verify" in t or "verifying" in t
@@ -92,6 +126,41 @@ def _is_verification_text(text: str) -> bool:
 def _looks_like_404(text: str) -> bool:
     t = (text or "").lower()
     return "hmm, 404" in t or "we’re a bit lost" in t or "we're a bit lost" in t or "couldn’t find that page" in t or "couldn't find that page" in t
+
+
+def _wait_for_manual_verification_selenium(
+    driver: Any,
+    *,
+    timeout_seconds: int,
+    poll_seconds: int = 10,
+) -> tuple[bool, str]:
+    end = time.time() + max(0, int(timeout_seconds))
+    last_html = ""
+    while time.time() <= end:
+        last_html = driver.page_source or ""
+        if not du.is_blocked_for_discovery(last_html) and not du.looks_like_verification(last_html):
+            return True, last_html
+        time.sleep(max(1, int(poll_seconds)))
+    return False, last_html
+
+
+def _wait_for_manual_verification_playwright(
+    page: Any,
+    *,
+    timeout_seconds: int,
+    poll_seconds: int = 10,
+) -> tuple[bool, str]:
+    end = time.time() + max(0, int(timeout_seconds))
+    last_html = ""
+    while time.time() <= end:
+        try:
+            last_html = page.content()
+        except Exception:
+            last_html = ""
+        if not du.is_blocked_for_discovery(last_html) and not du.looks_like_verification(last_html):
+            return True, last_html
+        page.wait_for_timeout(max(1000, int(poll_seconds) * 1000))
+    return False, last_html
 
 
 def _extract_ticket_urls_from_any_json(obj: Any, *, event_url: str) -> set[str]:
@@ -163,11 +232,14 @@ def discover_ticket_urls_from_event_playwright(
     page_timeout_ms: int = 45_000,
     pre_network_wait_ms: int = 1500,
     post_network_wait_ms: int = 2500,
+    debug_root: str = "step2",
+    wait_for_manual_verification: bool = False,
+    manual_verification_timeout: int = 300,
 ) -> Step2Result:
     ev = du.normalize_url(event_url) or event_url
     debug_dir = None
     if debug:
-        root = _ensure_debug_dir()
+        root = _ensure_debug_dir(debug_root)
         sub = root / _safe_key_from_event_url(ev)
         sub.mkdir(parents=True, exist_ok=True)
         debug_dir = str(sub.resolve())
@@ -277,6 +349,15 @@ def discover_ticket_urls_from_event_playwright(
                 if headed:
                     page.wait_for_timeout(int(getattr(config, "MANUAL_VERIFY_WAIT_SECONDS", 90)) * 1000)
                     html = page.content()
+                    if wait_for_manual_verification and du.looks_like_verification(html) and du.is_blocked_for_discovery(html):
+                        ok, html2 = _wait_for_manual_verification_playwright(
+                            page,
+                            timeout_seconds=int(manual_verification_timeout),
+                            poll_seconds=10,
+                        )
+                        html = html2 or html
+                        if ok:
+                            verification = False
                     if du.looks_like_verification(html) and du.is_blocked_for_discovery(html):
                         return Step2Result(ev, "blocked", True, "none", [], debug_dir=debug_dir)
                 else:
@@ -395,23 +476,164 @@ def discover_ticket_urls_from_event_playwright(
                 browser.close()
 
 
+def discover_ticket_urls_from_event_selenium(
+    event_url: str,
+    *,
+    headed: bool,
+    debug: bool,
+    verification_wait_seconds: int = 60,
+    debug_root: str = "step2_vps_live",
+    wait_for_manual_verification: bool = False,
+    manual_verification_timeout: int = 300,
+) -> Step2Result:
+    ev = du.normalize_url(event_url) or event_url
+    debug_dir = None
+    if debug:
+        root = _ensure_debug_dir(debug_root)
+        sub = root / _safe_key_from_event_url(ev)
+        sub.mkdir(parents=True, exist_ok=True)
+        debug_dir = str(sub.resolve())
+
+    driver = du.new_driver(headless=not headed)
+    try:
+        html = ""
+        visible_text = ""
+        current_url = ev
+        snippets: list[dict[str, Any]] = []
+
+        def _read_state() -> tuple[str, str, str]:
+            h = driver.page_source or ""
+            t = ""
+            with contextlib.suppress(Exception):
+                t = str(driver.execute_script("return document.body && document.body.innerText") or "")
+            c = ""
+            with contextlib.suppress(Exception):
+                c = str(getattr(driver, "current_url", "") or "")
+            return h, t, c
+
+        driver.set_page_load_timeout(max(60, verification_wait_seconds + 30))
+        driver.get(ev)
+        time.sleep(1.5)
+        html = du.wait_for_page_content(driver, headless=not headed)
+        html, visible_text, current_url = _read_state()
+        verification = du.is_blocked_for_discovery(html) or du.looks_like_verification(html) or _is_verification_text(visible_text)
+
+        # Stronger wait-before-block: wait -> reload -> wait.
+        if verification:
+            time.sleep(max(0, int(verification_wait_seconds)))
+            with contextlib.suppress(Exception):
+                driver.get(ev)
+            time.sleep(1.0)
+            html = du.wait_for_page_content(driver, headless=not headed)
+            html, visible_text, current_url = _read_state()
+            verification = du.is_blocked_for_discovery(html) or du.looks_like_verification(html) or _is_verification_text(visible_text)
+            if verification:
+                time.sleep(max(0, int(verification_wait_seconds)))
+                html, visible_text, current_url = _read_state()
+                verification = du.is_blocked_for_discovery(html) or du.looks_like_verification(html) or _is_verification_text(visible_text)
+            if verification and wait_for_manual_verification:
+                ok, html_wait = _wait_for_manual_verification_selenium(
+                    driver,
+                    timeout_seconds=int(manual_verification_timeout),
+                    poll_seconds=10,
+                )
+                html = html_wait or html
+                html, visible_text, current_url = _read_state()
+                verification = not ok
+            if verification:
+                _write_step2_artifacts(
+                    debug_dir=debug_dir,
+                    html=html,
+                    visible_text=visible_text,
+                    current_url=current_url,
+                    browser_strategy="selenium_verification_blocked",
+                    extracted_json_snippets=snippets,
+                    screenshot_writer=getattr(driver, "save_screenshot", None),
+                )
+                return Step2Result(ev, "blocked", True, "selenium", [], debug_dir=debug_dir)
+
+        # Human-like behavior: scroll/hydrate then parse.
+        du.scroll_for_lazy_content(driver)
+        time.sleep(0.8)
+        du.expand_main_accordions(driver, max_clicks=12)
+        revealed = du.reveal_event_page_deep_links(driver, ev)
+        html, visible_text, current_url = _read_state()
+        merged = du.merge_link_candidates(html, driver, ev)
+        merged |= revealed
+
+        tickets: set[str] = set()
+        for u in merged:
+            nu = du.normalize_url(u)
+            if not nu or not du.is_ticket_url(nu):
+                continue
+            eu = du.normalize_url(du.event_url_from_ticket_url(nu) or "")
+            if eu == ev:
+                tickets.add(nu)
+
+        cache_tickets = du.extract_ticket_urls_from_eventtype_cache(html, base_url=ev)
+        for tu in cache_tickets:
+            nu = du.normalize_url(tu)
+            if nu and du.normalize_url(du.event_url_from_ticket_url(nu) or "") == ev:
+                tickets.add(nu)
+
+        snippets.append(
+            {
+                "merge_candidates_count": len(merged),
+                "eventtype_cache_count": len(cache_tickets),
+                "revealed_count": len(revealed),
+            }
+        )
+        _write_step2_artifacts(
+            debug_dir=debug_dir,
+            html=html,
+            visible_text=visible_text,
+            current_url=current_url,
+            browser_strategy="selenium",
+            extracted_json_snippets=snippets,
+            screenshot_writer=getattr(driver, "save_screenshot", None),
+        )
+        if tickets:
+            return Step2Result(ev, "ok", False, "selenium", sorted(tickets), debug_dir=debug_dir)
+        return Step2Result(ev, "no_data", False, "selenium", [], debug_dir=debug_dir)
+    finally:
+        with contextlib.suppress(Exception):
+            driver.quit()
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="STEP 2: discover deep TicketSwap ticket URLs from an event page.")
     p.add_argument("--event-url", required=True)
+    p.add_argument("--browser", choices=["playwright", "selenium"], default="playwright")
     p.add_argument("--headed", action="store_true", default=False, help="Run non-headless (recommended if verification appears).")
     p.add_argument("--debug", action="store_true", default=False, help="Write debug artifacts to debug/step2/")
     p.add_argument("--db-fallback", action="store_true", default=True, help="Allow fallback to ticketswap.db if URLs exist.")
+    p.add_argument("--verification-wait", type=int, default=60, help="Seconds to wait before retrying verification pages.")
+    p.add_argument("--wait-for-manual-verification", action="store_true", default=False)
     return p.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    res = discover_ticket_urls_from_event_playwright(
-        args.event_url,
-        headed=bool(args.headed),
-        debug=bool(args.debug),
-        db_fallback=bool(args.db_fallback),
-    )
+    if args.browser == "selenium":
+        res = discover_ticket_urls_from_event_selenium(
+            args.event_url,
+            headed=bool(args.headed),
+            debug=bool(args.debug),
+            verification_wait_seconds=int(args.verification_wait),
+            debug_root="step2_vps_live",
+            wait_for_manual_verification=bool(args.wait_for_manual_verification),
+            manual_verification_timeout=300,
+        )
+    else:
+        res = discover_ticket_urls_from_event_playwright(
+            args.event_url,
+            headed=bool(args.headed),
+            debug=bool(args.debug),
+            db_fallback=bool(args.db_fallback),
+            debug_root="step2_vps_live",
+            wait_for_manual_verification=bool(args.wait_for_manual_verification),
+            manual_verification_timeout=300,
+        )
     print(f"event_url: {res.event_url}")
     print(f"status: {res.status}")
     print(f"verification_detected: {res.verification}")

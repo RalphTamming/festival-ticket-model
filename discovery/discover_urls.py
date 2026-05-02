@@ -224,7 +224,7 @@ def setup_logging(verbose: bool) -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
-def new_driver(*, headless: bool) -> uc.Chrome:
+def new_driver(*, headless: bool, extra_args: Optional[Sequence[str]] = None) -> uc.Chrome:
     def _build_kw() -> dict:
         options = uc.ChromeOptions()
         config.apply_persistent_chrome_profile(options)
@@ -236,6 +236,9 @@ def new_driver(*, headless: bool) -> uc.Chrome:
         options.add_argument("--no-default-browser-check")
         options.add_argument("--disable-notifications")
         options.add_argument("--disable-popup-blocking")
+        for a in (extra_args or []):
+            if a:
+                options.add_argument(str(a))
         udd = config.persistent_browser_user_data_dir()
         kw: dict = dict(options=options, headless=headless, use_subprocess=True)
         if udd is not None:

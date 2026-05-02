@@ -20,7 +20,11 @@ from zoneinfo import ZoneInfo
 import config
 import db
 from discovery import discover_urls as du
-from discovery.step2_discover_ticket_urls import Step2Result, discover_ticket_urls_from_event_playwright
+from discovery.step2_discover_ticket_urls import (
+    Step2Result,
+    discover_ticket_urls_from_event_playwright,
+    discover_ticket_urls_from_event_selenium,
+)
 from scraping import scrape_market as sm
 
 
@@ -104,64 +108,90 @@ def _run_step1_events(listing_url: str, *, limit_events: int, headless: bool) ->
     return list(dict.fromkeys(events))[: int(limit_events)]
 
 
-def _discover_with_retry(event_url: str, *, headed: bool, debug: bool) -> tuple[Step2Result, int, Optional[str]]:
-    return _discover_with_retry_tuned(
-        event_url,
-        headed=headed,
-        debug=debug,
-        retries=1,
-        blocked_sleep_min=2,
-        blocked_sleep_max=5,
-        page_timeout_ms=45_000,
-        pre_network_wait_ms=1500,
-        post_network_wait_ms=2500,
-    )
-
-
-def _discover_with_retry_tuned(
+def _discover_live_with_retry(
     event_url: str,
     *,
     headed: bool,
     debug: bool,
+    browser: str,
+    verification_wait_seconds: int,
+    wait_for_manual_verification: bool,
+    manual_verification_timeout: int,
     retries: int,
     blocked_sleep_min: int,
     blocked_sleep_max: int,
     page_timeout_ms: int,
     pre_network_wait_ms: int,
     post_network_wait_ms: int,
-) -> tuple[Step2Result, int, Optional[str]]:
+) -> tuple[Step2Result, int, Optional[str], bool]:
     last: Optional[Step2Result] = None
     err_detail: Optional[str] = None
     total_attempts = max(1, int(retries) + 1)
+    verification_detected = False
     for attempt in range(total_attempts):
         if attempt:
             _jitter(float(blocked_sleep_min), float(max(blocked_sleep_min, blocked_sleep_max)))
         try:
-            res = discover_ticket_urls_from_event_playwright(
-                event_url,
-                headed=bool(headed),
-                debug=bool(debug),
-                db_fallback=True,
-                page_timeout_ms=int(page_timeout_ms),
-                pre_network_wait_ms=int(pre_network_wait_ms),
-                post_network_wait_ms=int(post_network_wait_ms),
-            )
+            order: list[str]
+            b = str(browser or "auto")
+            if b == "selenium":
+                order = ["selenium", "playwright"]
+            elif b == "playwright":
+                order = ["playwright", "selenium"]
+            else:
+                order = ["selenium", "playwright"]
+
+            res = Step2Result(du.normalize_url(event_url) or event_url, "no_data", False, "none", [], debug_dir=None)
+            for strategy in order:
+                if strategy == "selenium":
+                    cand = discover_ticket_urls_from_event_selenium(
+                        event_url,
+                        headed=bool(headed),
+                        debug=bool(debug),
+                        verification_wait_seconds=int(verification_wait_seconds),
+                        debug_root="step2_vps_live",
+                        wait_for_manual_verification=bool(wait_for_manual_verification),
+                        manual_verification_timeout=int(manual_verification_timeout),
+                    )
+                else:
+                    cand = discover_ticket_urls_from_event_playwright(
+                        event_url,
+                        headed=bool(headed),
+                        debug=bool(debug),
+                        db_fallback=False,
+                        page_timeout_ms=int(page_timeout_ms),
+                        pre_network_wait_ms=int(pre_network_wait_ms),
+                        post_network_wait_ms=int(post_network_wait_ms),
+                        debug_root="step2_vps_live",
+                        wait_for_manual_verification=bool(wait_for_manual_verification),
+                        manual_verification_timeout=int(manual_verification_timeout),
+                    )
+                if cand.verification:
+                    verification_detected = True
+                if cand.status == "ok" and cand.ticket_urls:
+                    res = cand
+                    break
+                # keep the most informative failure as last
+                res = cand
+                if cand.status == "blocked":
+                    # Give strategy a chance to recover with manual wait inside it; try next strategy now.
+                    continue
         except Exception as e:
             err_detail = f"{type(e).__name__}: {e}"
             if attempt < total_attempts - 1:
                 continue
             ev = du.normalize_url(event_url) or event_url
-            return Step2Result(ev, "error", False, "none", [], debug_dir=None), attempt + 1, err_detail
+            return Step2Result(ev, "error", False, "none", [], debug_dir=None), attempt + 1, err_detail, verification_detected
         last = res
         if res.status == "ok" and res.ticket_urls:
-            return res, attempt + 1, None
+            return res, attempt + 1, None, verification_detected
         if res.status == "blocked" and attempt < total_attempts - 1:
             continue
         if res.status == "no_data" and attempt < total_attempts - 1 and headed:
             continue
-        return res, attempt + 1, None
+        return res, attempt + 1, None, verification_detected
     assert last is not None
-    return last, total_attempts, err_detail
+    return last, total_attempts, err_detail, verification_detected
 
 
 def _scrape_with_retry(
@@ -349,6 +379,12 @@ def run_discovery_mode(args: Any) -> int:
     blocked_sleep_min = int(getattr(args, "step2_blocked_sleep_min", 30))
     blocked_sleep_max = int(getattr(args, "step2_blocked_sleep_max", 90))
     safe_mode = bool(getattr(args, "vps_safe_mode", False))
+    verification_wait = int(getattr(args, "step2_verification_wait", 60))
+    wait_for_manual_verification = bool(getattr(args, "wait_for_manual_verification", False))
+    require_fresh_step2 = bool(getattr(args, "require_fresh_step2", False))
+    browser_pref = str(getattr(args, "step2_browser", "auto"))
+    if safe_mode and browser_pref == "auto":
+        browser_pref = "selenium"
     page_timeout_ms = 75_000 if safe_mode else 45_000
     pre_network_wait_ms = 3000 if safe_mode else 1500
     post_network_wait_ms = 5000 if safe_mode else 2500
@@ -358,11 +394,12 @@ def run_discovery_mode(args: Any) -> int:
         "listing_urls": len(listing_urls),
         "events_collected": 0,
         "events_upserted": 0,
-        "ticket_types_seen": 0,
-        "ticket_types_upserted": 0,
+        "step2_fresh_ok": 0,
         "step2_blocked": 0,
+        "step2_db_fallback_used": 0,
         "step2_errors": 0,
-        "step2_db_fallback_due_to_block": 0,
+        "ticket_types_fresh_upserted": 0,
+        "ticket_types_fallback_upserted": 0,
         "stopped_early_blocked": 0,
     }
     try:
@@ -372,10 +409,14 @@ def run_discovery_mode(args: Any) -> int:
             for ev in events:
                 slug = _event_slug(ev)
                 _jitter(inter_event_min, inter_event_max)
-                step2, _, _ = _discover_with_retry_tuned(
+                step2, _, _, _verification_seen = _discover_live_with_retry(
                     ev,
                     headed=bool(args.headed),
                     debug=bool(args.debug),
+                    browser=browser_pref,
+                    verification_wait_seconds=verification_wait,
+                    wait_for_manual_verification=wait_for_manual_verification,
+                    manual_verification_timeout=300,
                     retries=retries,
                     blocked_sleep_min=blocked_sleep_min,
                     blocked_sleep_max=blocked_sleep_max,
@@ -387,6 +428,9 @@ def run_discovery_mode(args: Any) -> int:
                     blocked_count += 1
                     counts["step2_blocked"] += 1
                     blocked_consecutive += 1
+                elif step2.status == "ok" and step2.ticket_urls:
+                    counts["step2_fresh_ok"] += 1
+                    blocked_consecutive = 0
                 elif step2.status == "error":
                     counts["step2_errors"] += 1
                     blocked_consecutive = 0
@@ -406,14 +450,26 @@ def run_discovery_mode(args: Any) -> int:
                 )
                 counts["events_upserted"] += 1
                 ticket_urls_for_event = list(step2.ticket_urls)
-                strategy = step2.strategy
-                if step2.status == "blocked" and not ticket_urls_for_event:
+                is_fallback = False
+                if (not require_fresh_step2) and step2.status == "blocked" and not ticket_urls_for_event:
                     known = db.list_ticket_urls_for_event(conn, event_url=ev)
                     if known:
                         ticket_urls_for_event = known
-                        strategy = "db_fallback_due_to_block"
-                        counts["step2_db_fallback_due_to_block"] += 1
+                        is_fallback = True
+                        counts["step2_db_fallback_used"] += 1
                         logging.warning("STEP2 blocked for %s; reusing %d DB ticket URLs", ev, len(ticket_urls_for_event))
+                elif (not require_fresh_step2) and step2.status in ("no_data", "error") and not ticket_urls_for_event:
+                    known = db.list_ticket_urls_for_event(conn, event_url=ev)
+                    if known:
+                        ticket_urls_for_event = known
+                        is_fallback = True
+                        counts["step2_db_fallback_used"] += 1
+                        logging.warning(
+                            "STEP2 %s for %s; reusing %d DB ticket URLs",
+                            step2.status,
+                            ev,
+                            len(ticket_urls_for_event),
+                        )
 
                 for tu in ticket_urls_for_event:
                     t_slug, t_label = du.ticket_type_from_ticket_url(tu)
@@ -426,8 +482,10 @@ def run_discovery_mode(args: Any) -> int:
                         ticket_type_label=t_label,
                         status="active",
                     )
-                    counts["ticket_types_seen"] += 1
-                    counts["ticket_types_upserted"] += 1
+                    if is_fallback:
+                        counts["ticket_types_fallback_upserted"] += 1
+                    else:
+                        counts["ticket_types_fresh_upserted"] += 1
                 if blocked_consecutive > stop_threshold:
                     stopped_early_blocked = True
                     counts["stopped_early_blocked"] = 1
@@ -442,15 +500,22 @@ def run_discovery_mode(args: Any) -> int:
 
         paths = _export_mode_csvs(conn, Path("data/outputs"))
         final_status = "ok"
-        if stopped_early_blocked or (counts["step2_blocked"] > 0 and counts["ticket_types_upserted"] == 0):
+        if require_fresh_step2 and (counts["ticket_types_fresh_upserted"] == 0):
+            final_status = "verification_blocked"
+        elif stopped_early_blocked or (counts["step2_blocked"] > 0 and counts["ticket_types_fresh_upserted"] == 0):
             final_status = "verification_blocked_partial"
         db.finish_pipeline_run(conn, run_id=run_id, status=final_status, counts=counts, error_summary=None)
         _send_telegram(
             f"TicketSwap discovery finished ({scope_name}) events={counts['events_upserted']} "
-            f"ticket_types={counts['ticket_types_upserted']} blocked={counts['step2_blocked']} status={final_status}"
+            f"fresh={counts['ticket_types_fresh_upserted']} fallback={counts['ticket_types_fallback_upserted']} "
+            f"blocked={counts['step2_blocked']} status={final_status}"
         )
         if blocked_count >= 5:
             _send_telegram(f"TicketSwap warning: verification_blocked occurred {blocked_count} times in discovery run.")
+        if require_fresh_step2 and final_status == "verification_blocked":
+            _send_telegram(
+                "TicketSwap discovery blocked in require-fresh mode: no fresh STEP2 ticket URLs discovered."
+            )
         if stopped_early_blocked:
             _send_telegram(
                 f"TicketSwap discovery stopped early on VPS due to consecutive step2 blocks ({blocked_consecutive})."
@@ -459,6 +524,8 @@ def run_discovery_mode(args: Any) -> int:
             _send_telegram(
                 "TicketSwap discovery ended with verification_blocked_partial (no new ticket types discovered)."
             )
+        if counts["ticket_types_fresh_upserted"] == 0:
+            logging.warning("0 fresh ticket URLs discovered in this discovery run.")
         print(json.dumps({"run_id": run_id, "mode": "discovery", "status": final_status, "counts": counts}, indent=2))
         print(f"CSV exports: {', '.join(str(p) for p in paths.values())}")
         return 3 if stopped_early_blocked else 0
