@@ -311,15 +311,31 @@ def _run_step1_events(listing_url: str, *, limit_events: int, headless: bool) ->
         raise RuntimeError(
             f"STEP1 failed for {listing_url} (code={p.returncode}): {(p.stderr or p.stdout or '')[-600:]}"
         )
+    # STEP1 emits two named blocks: HUB_URLS (festival hub pages) and
+    # EVENT_URLS (direct event pages). On the live TicketSwap listing the
+    # tiles overwhelmingly link to hubs (verified manually 2026-05-03 against
+    # the Amsterdam location=3 listing: 11 hubs vs 1 direct event), and
+    # STEP2's loaded-page extractor reads ticket-type links from both shapes.
+    # Treat both as valid STEP2 inputs, preferring direct event URLs first.
     events: list[str] = []
+    hubs: list[str] = []
     mode = ""
     for ln in (p.stdout or "").splitlines():
-        if ln.strip() == "EVENT_URLS":
+        s = ln.strip()
+        if s == "EVENT_URLS":
             mode = "events"
             continue
-        if mode == "events" and ln.strip().startswith("https://www.ticketswap.com/festival-tickets/") and "/festival-tickets/a/" not in ln:
-            events.append(ln.strip())
-    return list(dict.fromkeys(events))[: int(limit_events)]
+        if s == "HUB_URLS":
+            mode = "hubs"
+            continue
+        if not s.startswith("https://www.ticketswap.com/festival-tickets/"):
+            continue
+        if mode == "events" and "/festival-tickets/a/" not in s:
+            events.append(s)
+        elif mode == "hubs" and "/festival-tickets/a/" in s:
+            hubs.append(s)
+    combined = list(dict.fromkeys(events + hubs))
+    return combined[: int(limit_events)]
 
 
 def _save_shared_step2_debug(
@@ -356,23 +372,33 @@ def _save_shared_step2_debug(
 
 
 def _collect_listing_event_urls_live(driver: Any, listing_url: str, *, limit_events: int) -> list[str]:
+    # The Amsterdam-pinned listing tiles often link to hub URLs
+    # (/festival-tickets/a/<slug>) instead of to direct event pages.
+    # STEP2's loaded-page extractor reads ticket-type links from both shapes,
+    # so we treat both as valid click targets here. Direct event URLs are
+    # preferred over hubs for click order to keep listings deterministic.
     html = driver.page_source or ""
     hrefs = sorted(du.merge_link_candidates(html, driver, base_url=listing_url))
-    out: list[str] = []
+    events: list[str] = []
+    hubs: list[str] = []
     for h in hrefs:
         n = du.normalize_url(h)
-        if not n:
+        if not n or du.is_ticket_url(n):
             continue
-        if not du.is_event_page(n):
+        if du.is_event_page(n):
+            if n not in events:
+                events.append(n)
+        elif du.is_festival_page(n):
+            if n not in hubs:
+                hubs.append(n)
+    combined: list[str] = []
+    for u in events + hubs:
+        if u in combined:
             continue
-        if du.is_festival_page(n) or du.is_ticket_url(n):
-            continue
-        if n in out:
-            continue
-        out.append(n)
-        if len(out) >= int(limit_events):
+        combined.append(u)
+        if len(combined) >= int(limit_events):
             break
-    return out
+    return combined
 
 
 def _click_event_link_on_listing(driver: Any, event_url: str) -> bool:

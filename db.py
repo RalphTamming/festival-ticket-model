@@ -737,8 +737,24 @@ def upsert_event_record(
     """
     now = _utc_now_iso()
     event_id = event_slug
-    conn.execute(
-        """
+    insert_params = (
+        event_id,
+        event_url,
+        event_slug,
+        event_name,
+        event_date_local,
+        category,
+        location,
+        location,
+        country,
+        region,
+        now,
+        now,
+        status,
+        now,
+        now,
+    )
+    insert_sql = """
         INSERT INTO events (
           event_id, event_url, event_slug, event_name, event_date_local, category,
           location, city, country, region, first_seen_at_utc, last_seen_at_utc, status,
@@ -757,26 +773,50 @@ def upsert_event_record(
           last_seen_at_utc=excluded.last_seen_at_utc,
           status=excluded.status,
           updated_at_utc=excluded.updated_at_utc
-        """,
-        (
-            event_id,
-            event_url,
-            event_slug,
-            event_name,
-            event_date_local,
-            category,
-            location,
-            location,
-            country,
-            region,
-            now,
-            now,
-            status,
-            now,
-            now,
-        ),
-    )
-    row = conn.execute("SELECT event_id FROM events WHERE event_url=?", (event_url,)).fetchone()
+    """
+    try:
+        conn.execute(insert_sql, insert_params)
+    except sqlite3.IntegrityError:
+        # Two unique constraints on this table: PRIMARY KEY (event_id) and
+        # UNIQUE (event_url). The ON CONFLICT clause only catches one of
+        # them, so a slug collision (same event_id, different event_url)
+        # raises here. Fall back to a slug-keyed UPDATE that refreshes
+        # metadata without touching first_seen_at_utc/created_at_utc.
+        conn.execute(
+            """
+            UPDATE events SET
+              event_url=?,
+              event_name=COALESCE(?, event_name),
+              event_date_local=COALESCE(?, event_date_local),
+              category=COALESCE(?, category),
+              location=COALESCE(?, location),
+              city=COALESCE(?, city),
+              country=COALESCE(?, country),
+              region=COALESCE(?, region),
+              last_seen_at_utc=?,
+              status=?,
+              updated_at_utc=?
+            WHERE event_id=?
+            """,
+            (
+                event_url,
+                event_name,
+                event_date_local,
+                category,
+                location,
+                location,
+                country,
+                region,
+                now,
+                status,
+                now,
+                event_id,
+            ),
+        )
+    row = conn.execute(
+        "SELECT event_id FROM events WHERE event_url=? OR event_id=?",
+        (event_url, event_id),
+    ).fetchone()
     conn.commit()
     return str(row["event_id"]) if row and row["event_id"] else event_id
 

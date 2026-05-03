@@ -134,15 +134,44 @@ def classify_loaded_selenium_page(
     html: str,
     visible_text: str,
 ) -> str:
+    """Classify what kind of page Selenium ended up on.
+
+    Important: do NOT classify by substring-matching the raw HTML for words
+    like "forbidden", "unauthorized", or `iframe src="/401"`. Modern
+    TicketSwap pages embed an `iframe src="/401"` plus React-router error
+    route definitions in their bundled JS on every single page (verified
+    against a known-good event page on 2026-05-03 - 2 occurrences of
+    `iframe src="/401"` and the words "forbidden"/"unauthorized" each
+    appearing inside the minified app bundle). Those are NOT signals that
+    the user landed on a 401 page.
+
+    Trust signals, in order:
+      1. The actual URL (`/401` in the path) - this is the only reliable
+         hard 401 indicator.
+      2. `is_blocked_for_discovery` / `looks_like_verification` (these are
+         conservative and require the absence of TicketSwap content signals).
+      3. Verification phrases that show up in the *visible text* of a short
+         page (real pages contain hundreds of characters of content).
+      4. 404 visible-text patterns.
+      5. Visible-text presence of multiple ticket-related signals as a
+         positive indicator of a real event/festival/hub page.
+    """
     cur = (current_url or "").lower()
-    txt = f"{html}\n{visible_text}".lower()
-    if "/401" in cur or 'iframe src="/401"' in txt or "forbidden" in txt or "unauthorized" in txt:
+    vis = (visible_text or "").lower()
+
+    if "/401" in cur:
         return "401_or_forbidden"
-    if du.is_blocked_for_discovery(html) or du.looks_like_verification(html) or _is_verification_text(visible_text):
+    if du.is_blocked_for_discovery(html) or du.looks_like_verification(html):
+        return "verification_page"
+    if _is_verification_text(visible_text) and len(visible_text or "") < 400:
         return "verification_page"
     if _looks_like_404(visible_text or html):
         return "404"
-    if "ticket" in txt or "tickets" in txt or "wanted" in txt or "available" in txt:
+    real_signals = 0
+    for s in ("ticket", "tickets", "available", "wanted", "sold", "interested", "going", "entrance"):
+        if s in vis:
+            real_signals += 1
+    if real_signals >= 2:
         return "real_event_page"
     return "unknown"
 
