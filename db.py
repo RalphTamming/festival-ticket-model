@@ -182,6 +182,12 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
   counts_json TEXT,
   error_summary TEXT
 );
+
+CREATE TABLE IF NOT EXISTS app_kv (
+  key TEXT PRIMARY KEY,
+  value TEXT,
+  updated_at_utc TEXT NOT NULL
+);
 """
 
 
@@ -206,6 +212,12 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "market_snapshots", "ticket_type_id", "INTEGER")
     _ensure_column(conn, "market_snapshots", "run_id", "TEXT")
     _ensure_column(conn, "market_snapshots", "listings_json", "TEXT")
+    _ensure_column(conn, "market_snapshots", "days_until_event", "INTEGER")
+    _ensure_column(conn, "market_snapshots", "hours_until_event", "REAL")
+    _ensure_column(conn, "market_snapshots", "event_weekday", "TEXT")
+    _ensure_column(conn, "market_snapshots", "event_month", "INTEGER")
+    _ensure_column(conn, "market_snapshots", "total_available_quantity", "INTEGER")
+    _ensure_column(conn, "market_snapshots", "is_sold_out", "INTEGER")
     conn.commit()
 
 
@@ -821,6 +833,7 @@ def list_ticket_types_for_monitoring(conn: sqlite3.Connection, *, limit: Optiona
       e.event_slug,
       e.event_name,
       e.event_date_local,
+      e.start_datetime_utc,
       e.category,
       e.location,
       e.country,
@@ -923,6 +936,10 @@ def insert_market_snapshot_for_ticket_type(
     else:
         ticket_url_id = int(ticket_url_id_row["ticket_url_id"])
 
+    listings_payload = [_listing_json_payload(x) for x in (snap.listings or [])]
+    total_available_quantity = sum(
+        int(item.get("quantity", 0) or 0) for item in listings_payload if item.get("quantity") is not None
+    )
     cur = conn.execute(
         """
         INSERT INTO market_snapshots (
@@ -930,9 +947,10 @@ def insert_market_snapshot_for_ticket_type(
           event_name, event_url, venue, city, country, event_date_local, ticket_type_label,
           currency, listing_count, wanted_count, sold_count, lowest_ask, highest_ask, median_ask, average_ask,
           new_listings_since_prev, removed_listings_since_prev, estimated_sale_speed_listings_per_hour,
-          listings_json, raw_debug_json
+          listings_json, raw_debug_json, days_until_event, hours_until_event, event_weekday, event_month,
+          total_available_quantity, is_sold_out
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             ticket_url_id,
@@ -962,8 +980,14 @@ def insert_market_snapshot_for_ticket_type(
             snap.new_listings_since_prev,
             snap.removed_listings_since_prev,
             snap.estimated_sale_speed_listings_per_hour,
-            _safe_json([getattr(x, "__dict__", str(x)) for x in snap.listings]) if snap.listings else "[]",
+            _safe_json(listings_payload) if listings_payload else "[]",
             _safe_json(snap.raw_debug) if snap.raw_debug else None,
+            _event_days_until(snap),
+            _event_hours_until(snap),
+            _event_weekday(snap),
+            _event_month(snap),
+            total_available_quantity,
+            1 if int(snap.listing_count or 0) == 0 else 0,
         ),
     )
     conn.commit()
@@ -976,4 +1000,85 @@ def _utc_now_iso() -> str:
 
 def _safe_json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, default=str)
+
+
+def _event_days_until(snap: MarketSnapshot) -> Optional[int]:
+    event_dt = _event_datetime_utc_from_snapshot(snap)
+    if event_dt is None:
+        return None
+    now = datetime.now(timezone.utc)
+    return int((event_dt.date() - now.date()).days)
+
+
+def _event_hours_until(snap: MarketSnapshot) -> Optional[float]:
+    event_dt = _event_datetime_utc_from_snapshot(snap)
+    if event_dt is None:
+        return None
+    now = datetime.now(timezone.utc)
+    return round((event_dt - now).total_seconds() / 3600.0, 3)
+
+
+def _event_weekday(snap: MarketSnapshot) -> Optional[str]:
+    event_dt = _event_datetime_utc_from_snapshot(snap)
+    if event_dt is None:
+        return None
+    return event_dt.strftime("%A")
+
+
+def _event_month(snap: MarketSnapshot) -> Optional[int]:
+    event_dt = _event_datetime_utc_from_snapshot(snap)
+    if event_dt is None:
+        return None
+    return int(event_dt.month)
+
+
+def _event_datetime_utc_from_snapshot(snap: MarketSnapshot) -> Optional[datetime]:
+    val = (snap.event_date_local or "").strip()
+    if not val:
+        return None
+    try:
+        return datetime.fromisoformat(f"{val}T00:00:00+00:00")
+    except ValueError:
+        return None
+
+
+def _listing_json_payload(listing: Any) -> dict[str, Any]:
+    href = getattr(listing, "listing_href", None)
+    listing_id = _listing_id_from_href(href)
+    return {
+        "listing_id": listing_id,
+        "listing_url": href,
+        "price": getattr(listing, "price_per_ticket", None),
+        "quantity": getattr(listing, "quantity", None),
+        "currency": getattr(listing, "currency", None),
+        "seller_hint": getattr(listing, "seller_hint", None),
+        "fingerprint": getattr(listing, "listing_fingerprint", None),
+        "raw_text": getattr(listing, "raw_text", None),
+    }
+
+
+def _listing_id_from_href(href: Optional[str]) -> Optional[str]:
+    if not href:
+        return None
+    digits = "".join(ch for ch in str(href).rstrip("/").split("/")[-1] if ch.isdigit())
+    return digits or None
+
+
+def kv_get(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    row = conn.execute("SELECT value FROM app_kv WHERE key=?", (str(key),)).fetchone()
+    if row is None:
+        return None
+    return row["value"]
+
+
+def kv_set(conn: sqlite3.Connection, key: str, value: str) -> None:
+    now = _utc_now_iso()
+    conn.execute(
+        """
+        INSERT INTO app_kv (key, value, updated_at_utc) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at_utc=excluded.updated_at_utc
+        """,
+        (str(key), str(value), now),
+    )
+    conn.commit()
 

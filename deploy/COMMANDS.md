@@ -85,6 +85,21 @@ xvfb-run -a python run_pipeline.py --mode discovery --scope amsterdam_festivals 
 xvfb-run -a python run_pipeline.py --mode monitoring --headed --limit-tickets 5
 ```
 
+## Run 1-week production test (detached)
+
+```bash
+nohup bash scripts/run_week_production_test.sh > logs/week_production_test.nohup.log 2>&1 &
+```
+
+## Check 1-week production test
+
+```bash
+tail -f logs/week_production_test.log
+ps aux | grep run_week_production_test
+du -h ticketswap.db
+ls -lh data/exports data/outputs
+```
+
 ## View logs
 
 ```bash

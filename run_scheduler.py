@@ -79,19 +79,29 @@ def tier_for_event_dt(event_dt: Optional[datetime]) -> tuple[int, int, bool]:
         return 0, 0, False
 
     if now.date() == event_dt.date():
-        return 15, 100, True
+        return 60, 100, True
 
     days_until = (event_dt - now).total_seconds() / 86400.0
-    if days_until > 60:
+    if days_until > 30:
         return 24 * 60, 20, True
-    if 14 <= days_until <= 60:
+    if 8 <= days_until <= 30:
         return 12 * 60, 40, True
-    if 7 <= days_until < 14:
-        return 4 * 60, 60, True
-    if 2 <= days_until < 7:
-        return 2 * 60, 75, True
+    if 7 <= days_until < 8:
+        return 8 * 60, 60, True
+    if 6 <= days_until < 7:
+        return 6 * 60, 65, True
+    if 5 <= days_until < 6:
+        return int((24 / 5) * 60), 70, True
+    if 4 <= days_until < 5:
+        return 4 * 60, 75, True
+    if 3 <= days_until < 4:
+        return 3 * 60, 80, True
+    if 2 <= days_until < 3:
+        return int((24 / 10) * 60), 85, True
+    if 1 <= days_until < 2:
+        return int((24 / 10) * 60), 90, True
     if 0 <= days_until < 2:
-        return 30, 90, True
+        return 60, 95, True
     return 0, 0, False
 
 

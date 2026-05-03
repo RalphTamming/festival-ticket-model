@@ -6,7 +6,9 @@ This repo intentionally keeps configuration simple: edit this file or pass CLI f
 
 from __future__ import annotations
 
+import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -86,6 +88,115 @@ DEFAULT_SCOPE = os.getenv("DEFAULT_SCOPE", "amsterdam_festivals")
 MONITOR_START_HOUR = int(os.getenv("MONITOR_START_HOUR", "8"))
 MONITOR_END_HOUR = int(os.getenv("MONITOR_END_HOUR", "23"))
 MONITOR_AFTER_EVENT = str(os.getenv("MONITOR_AFTER_EVENT", "false")).lower() in ("1", "true", "yes", "on")
+DAILY_REPORT_TIME = os.getenv("DAILY_REPORT_TIME", "21:00")
+ENABLE_WEEKLY_EXPORT = str(os.getenv("ENABLE_WEEKLY_EXPORT", "true")).lower() in ("1", "true", "yes", "on")
+TELEGRAM_ERROR_ONLY_MODE = str(os.getenv("TELEGRAM_ERROR_ONLY_MODE", "false")).lower() in ("1", "true", "yes", "on")
+
+LOCATION_CACHE_PATH = Path(os.getenv("LOCATION_CACHE_PATH", "data/location_cache.json"))
+LOCATION_CACHE_MAX_AGE_DAYS = int(os.getenv("LOCATION_CACHE_MAX_AGE_DAYS", "30"))
+
+
+def _load_location_cache() -> dict[str, dict]:
+    if not LOCATION_CACHE_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(LOCATION_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for k, v in raw.items():
+        if isinstance(k, str) and isinstance(v, dict):
+            out[k] = v
+    return out
+
+
+def _cache_entry_fresh(entry: dict) -> bool:
+    ts = str(entry.get("last_verified_at", "") or "").strip()
+    if not ts:
+        return False
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return dt >= (datetime.now(timezone.utc) - timedelta(days=max(1, int(LOCATION_CACHE_MAX_AGE_DAYS))))
+
+
+def _scope_urls_for_country(cache: dict[str, dict], country_name: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for key, entry in cache.items():
+        parts = [p.strip() for p in str(key).split(",", 1)]
+        if len(parts) != 2:
+            continue
+        _city, country = parts
+        if country.lower() != country_name.lower():
+            continue
+        if not _cache_entry_fresh(entry):
+            continue
+        url = str(entry.get("resulting_url", "") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append(url)
+    return out
+
+
+def _scope_urls_for_locations(
+    cache: dict[str, dict],
+    locations: list[tuple[str, str]],
+    *,
+    fresh_only: bool = False,
+) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for city, country in locations:
+        key = f"{city},{country}"
+        entry = cache.get(key)
+        if not isinstance(entry, dict):
+            continue
+        if fresh_only and (not _cache_entry_fresh(entry)):
+            continue
+        url = str(entry.get("resulting_url", "") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append(url)
+    return out
+
+
+VERIFIED_WESTERN_EUROPE_LOCATIONS: list[tuple[str, str]] = [
+    ("Amsterdam", "Netherlands"),
+    ("Rotterdam", "Netherlands"),
+    ("Utrecht", "Netherlands"),
+    ("Eindhoven", "Netherlands"),
+    ("Groningen", "Netherlands"),
+    ("Brussels", "Belgium"),
+    ("Antwerp", "Belgium"),
+    ("Ghent", "Belgium"),
+    ("Berlin", "Germany"),
+    ("Hamburg", "Germany"),
+    ("Cologne", "Germany"),
+    ("Munich", "Germany"),
+    ("Paris", "France"),
+    ("Lyon", "France"),
+    ("Marseille", "France"),
+]
+
+
+_LOC_CACHE = _load_location_cache()
+_NL_URLS = _scope_urls_for_country(_LOC_CACHE, "Netherlands")
+_BE_URLS = _scope_urls_for_country(_LOC_CACHE, "Belgium")
+_DE_URLS = _scope_urls_for_country(_LOC_CACHE, "Germany")
+_FR_URLS = _scope_urls_for_country(_LOC_CACHE, "France")
+_LU_URLS = _scope_urls_for_country(_LOC_CACHE, "Luxembourg")
+_WESTERN_URLS = list(dict.fromkeys(_NL_URLS + _BE_URLS + _DE_URLS + _FR_URLS + _LU_URLS))
+_WESTERN_VERIFIED_URLS = _scope_urls_for_locations(
+    _LOC_CACHE,
+    VERIFIED_WESTERN_EUROPE_LOCATIONS,
+    fresh_only=False,
+)
 
 SCOPES: dict[str, dict] = {
     "amsterdam_festivals": {
@@ -93,16 +204,42 @@ SCOPES: dict[str, dict] = {
         "listing_urls": [
             "https://www.ticketswap.com/festival-tickets?slug=festival-tickets&location=3",
         ],
+        "enabled": True,
     },
-    # TODO: Add NL location-specific festival listing URLs/discovery heuristics.
-    "netherlands_festivals": {
+    "nl_festivals": {
         "category": "festival",
-        "listing_urls": [],
+        "listing_urls": _NL_URLS,
+        "enabled": False,
     },
-    # TODO: Add Western Europe scope URLs/filters once location strategy is stable.
+    "belgium_festivals": {
+        "category": "festival",
+        "listing_urls": _BE_URLS,
+        "enabled": False,
+    },
+    "germany_festivals": {
+        "category": "festival",
+        "listing_urls": _DE_URLS,
+        "enabled": False,
+    },
+    "france_festivals": {
+        "category": "festival",
+        "listing_urls": _FR_URLS,
+        "enabled": False,
+    },
+    "luxembourg_festivals": {
+        "category": "festival",
+        "listing_urls": _LU_URLS,
+        "enabled": False,
+    },
     "western_europe_festivals": {
         "category": "festival",
-        "listing_urls": [],
+        "listing_urls": _WESTERN_URLS,
+        "enabled": False,
+    },
+    "western_europe_festivals_verified": {
+        "category": "festival",
+        "listing_urls": _WESTERN_VERIFIED_URLS,
+        "enabled": False,
     },
 }
 

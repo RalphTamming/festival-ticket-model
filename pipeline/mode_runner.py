@@ -9,7 +9,7 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 from urllib.error import URLError
@@ -76,6 +76,216 @@ def _send_telegram(message: str) -> bool:
             return True
     except (URLError, TimeoutError):
         return False
+
+
+def _send_telegram_document(file_path: Path, *, caption: Optional[str] = None) -> bool:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id or not file_path.exists():
+        return False
+    boundary = f"----TicketSwapBoundary{int(time.time())}"
+    data = file_path.read_bytes()
+    parts = [
+        f"--{boundary}\r\n".encode("utf-8"),
+        b'Content-Disposition: form-data; name="chat_id"\r\n\r\n',
+        f"{chat_id}\r\n".encode("utf-8"),
+    ]
+    if caption:
+        parts.extend(
+            [
+                f"--{boundary}\r\n".encode("utf-8"),
+                b'Content-Disposition: form-data; name="caption"\r\n\r\n',
+                f"{caption}\r\n".encode("utf-8"),
+            ]
+        )
+    parts.extend(
+        [
+            f"--{boundary}\r\n".encode("utf-8"),
+            f'Content-Disposition: form-data; name="document"; filename="{file_path.name}"\r\n'.encode("utf-8"),
+            b"Content-Type: text/csv\r\n\r\n",
+            data,
+            b"\r\n",
+            f"--{boundary}--\r\n".encode("utf-8"),
+        ]
+    )
+    body = b"".join(parts)
+    req = Request(
+        url=f"https://api.telegram.org/bot{token}/sendDocument",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=20):
+            return True
+    except (URLError, TimeoutError):
+        return False
+
+
+def _send_error_alert(
+    *,
+    error_type: str,
+    event_url: Optional[str] = None,
+    debug_path: Optional[str] = None,
+    details: Optional[str] = None,
+) -> None:
+    if not os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or not os.getenv("TELEGRAM_CHAT_ID", "").strip():
+        return
+    parts = [f"TicketSwap ERROR: {error_type}"]
+    if event_url:
+        parts.append(f"event: {event_url}")
+    if debug_path:
+        parts.append(f"debug: {debug_path}")
+    if details:
+        parts.append(f"details: {details}")
+    _send_telegram("\n".join(parts))
+
+
+def _parse_daily_report_hour_minute(value: str) -> tuple[int, int]:
+    raw = (value or "21:00").strip()
+    try:
+        hh_s, mm_s = raw.split(":", 1)
+        hh = max(0, min(23, int(hh_s)))
+        mm = max(0, min(59, int(mm_s)))
+        return hh, mm
+    except Exception:
+        return 21, 0
+
+
+def _should_send_daily_report(now_local: datetime, conn: Any) -> bool:
+    if bool(getattr(config, "TELEGRAM_ERROR_ONLY_MODE", False)):
+        return False
+    hh, mm = _parse_daily_report_hour_minute(str(getattr(config, "DAILY_REPORT_TIME", "21:00")))
+    due_now = (now_local.hour > hh) or (now_local.hour == hh and now_local.minute >= mm)
+    if not due_now:
+        return False
+    key = "daily_report_last_sent_local_date"
+    sent = db.kv_get(conn, key)
+    today = now_local.date().isoformat()
+    return sent != today
+
+
+def _send_daily_report(conn: Any, now_local: datetime) -> None:
+    day_start_local = datetime(now_local.year, now_local.month, now_local.day, 0, 0, 0, tzinfo=now_local.tzinfo)
+    day_start_utc = day_start_local.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    day_start_utc_s = day_start_utc.isoformat(timespec="seconds") + "Z"
+    runs = conn.execute(
+        """
+        SELECT mode, status, counts_json, error_summary
+        FROM pipeline_runs
+        WHERE started_at_utc >= ?
+        """,
+        (day_start_utc_s,),
+    ).fetchall()
+    discovery_runs = sum(1 for r in runs if str(r["mode"]) == "discovery")
+    monitoring_runs = sum(1 for r in runs if str(r["mode"]) == "monitoring")
+    errors = 0
+    blocks = 0
+    for r in runs:
+        if r["status"] == "failed" or (r["error_summary"] or "").strip():
+            errors += 1
+        try:
+            c = json.loads(r["counts_json"] or "{}")
+        except Exception:
+            c = {}
+        blocks += int(c.get("step2_blocked", 0) or 0) + int(c.get("scrape_blocked", 0) or 0)
+        errors += int(c.get("scrape_error", 0) or 0) + int(c.get("step2_errors", 0) or 0)
+    snapshots_collected = int(
+        conn.execute("SELECT COUNT(*) AS c FROM market_snapshots WHERE scraped_at_utc >= ?", (day_start_utc_s,)).fetchone()["c"]
+    )
+    events_tracked = int(conn.execute("SELECT COUNT(*) AS c FROM events WHERE COALESCE(status, 'active')='active'").fetchone()["c"])
+    ticket_types_tracked = int(conn.execute("SELECT COUNT(*) AS c FROM ticket_types WHERE status='active'").fetchone()["c"])
+    status_summary = "healthy" if errors == 0 and blocks == 0 else "attention_needed"
+    _send_telegram(
+        "\n".join(
+            [
+                f"TicketSwap daily report ({now_local.date().isoformat()})",
+                f"monitoring_runs: {monitoring_runs}",
+                f"discovery_runs: {discovery_runs}",
+                f"snapshots_collected: {snapshots_collected}",
+                f"events_tracked: {events_tracked}",
+                f"ticket_types_tracked: {ticket_types_tracked}",
+                f"errors: {errors}",
+                f"blocks: {blocks}",
+                f"status: {status_summary}",
+            ]
+        )
+    )
+    db.kv_set(conn, "daily_report_last_sent_local_date", now_local.date().isoformat())
+
+
+def _maybe_export_weekly_report(conn: Any, now_local: datetime) -> Optional[Path]:
+    if not bool(getattr(config, "ENABLE_WEEKLY_EXPORT", True)):
+        return None
+    if bool(getattr(config, "TELEGRAM_ERROR_ONLY_MODE", False)):
+        return None
+    iso_year, iso_week, _ = now_local.isocalendar()
+    week_key = f"{iso_year}-W{iso_week:02d}"
+    if db.kv_get(conn, "weekly_report_last_iso_week") == week_key:
+        return None
+    if now_local.weekday() != 0:  # Monday
+        return None
+    exports_dir = Path("data/exports")
+    exports_dir.mkdir(parents=True, exist_ok=True)
+    out = exports_dir / f"weekly_report_{now_local.date().isoformat()}.csv"
+    rows = conn.execute(
+        """
+        SELECT
+          COALESCE(e.event_name, e.event_slug, ms.event_url) AS event,
+          COALESCE(tt.ticket_type_label, ms.ticket_type_label, tt.ticket_type_slug) AS ticket_type,
+          ms.lowest_ask,
+          ms.highest_ask,
+          ms.median_ask,
+          ms.average_ask,
+          ms.listing_count,
+          ms.wanted_count,
+          ms.scraped_at_utc
+        FROM market_snapshots ms
+        LEFT JOIN ticket_types tt ON tt.ticket_type_id = ms.ticket_type_id
+        LEFT JOIN events e ON e.event_id = tt.event_id
+        WHERE ms.scraped_at_utc >= datetime('now', '-7 days')
+        ORDER BY ms.scraped_at_utc DESC
+        """
+    ).fetchall()
+    with out.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(
+            [
+                "event",
+                "ticket_type",
+                "lowest_ask",
+                "highest_ask",
+                "median_ask",
+                "average_ask",
+                "listing_count",
+                "wanted_count",
+                "scraped_at_utc",
+            ]
+        )
+        for r in rows:
+            w.writerow(
+                [
+                    r["event"],
+                    r["ticket_type"],
+                    r["lowest_ask"],
+                    r["highest_ask"],
+                    r["median_ask"],
+                    r["average_ask"],
+                    r["listing_count"],
+                    r["wanted_count"],
+                    r["scraped_at_utc"],
+                ]
+            )
+    db.kv_set(conn, "weekly_report_last_iso_week", week_key)
+    if out.stat().st_size <= (45 * 1024 * 1024):
+        _send_telegram_document(out, caption=f"TicketSwap weekly report {now_local.date().isoformat()}")
+    return out
+
+
+def _maybe_send_daily_outputs(conn: Any, now_local: datetime) -> None:
+    if _should_send_daily_report(now_local, conn):
+        _send_daily_report(conn, now_local)
+        _maybe_export_weekly_report(conn, now_local)
 
 
 def _run_step1_events(listing_url: str, *, limit_events: int, headless: bool) -> list[str]:
@@ -299,7 +509,8 @@ def _export_mode_csvs(conn: Any, output_dir: Path) -> dict[str, Path]:
         )
         SELECT snapshot_id, ticket_type_id, ticket_url, scraped_at_utc, status, currency,
                listing_count, wanted_count, lowest_ask, highest_ask, median_ask, average_ask,
-               error_message, run_id
+               error_message, run_id, days_until_event, hours_until_event, event_weekday, event_month,
+               total_available_quantity, is_sold_out
         FROM ranked
         WHERE rn=1
         ORDER BY scraped_at_utc DESC
@@ -321,6 +532,12 @@ def _export_mode_csvs(conn: Any, output_dir: Path) -> dict[str, Path]:
             "average_ask",
             "error_message",
             "run_id",
+            "days_until_event",
+            "hours_until_event",
+            "event_weekday",
+            "event_month",
+            "total_available_quantity",
+            "is_sold_out",
         ]
         w = csv.writer(f)
         w.writerow(cols)
@@ -331,7 +548,8 @@ def _export_mode_csvs(conn: Any, output_dir: Path) -> dict[str, Path]:
         """
         SELECT snapshot_id, ticket_type_id, ticket_url, scraped_at_utc, status, currency,
                listing_count, wanted_count, lowest_ask, highest_ask, median_ask, average_ask,
-               error_message, run_id
+               error_message, run_id, days_until_event, hours_until_event, event_weekday, event_month,
+               total_available_quantity, is_sold_out
         FROM market_snapshots
         WHERE scraped_at_utc >= datetime('now', '-7 days')
         ORDER BY scraped_at_utc DESC
@@ -353,6 +571,12 @@ def _export_mode_csvs(conn: Any, output_dir: Path) -> dict[str, Path]:
             "average_ask",
             "error_message",
             "run_id",
+            "days_until_event",
+            "hours_until_event",
+            "event_weekday",
+            "event_month",
+            "total_available_quantity",
+            "is_sold_out",
         ]
         w = csv.writer(f)
         w.writerow(cols)
@@ -428,14 +652,34 @@ def run_discovery_mode(args: Any) -> int:
                     blocked_count += 1
                     counts["step2_blocked"] += 1
                     blocked_consecutive += 1
+                    if require_fresh_step2:
+                        _send_error_alert(
+                            error_type="step2_fresh_failure",
+                            event_url=ev,
+                            debug_path=step2.debug_dir,
+                            details="verification_blocked during require-fresh discovery",
+                        )
                 elif step2.status == "ok" and step2.ticket_urls:
                     counts["step2_fresh_ok"] += 1
                     blocked_consecutive = 0
                 elif step2.status == "error":
                     counts["step2_errors"] += 1
                     blocked_consecutive = 0
+                    _send_error_alert(
+                        error_type="step2_error",
+                        event_url=ev,
+                        debug_path=step2.debug_dir,
+                        details=step2.status,
+                    )
                 else:
                     blocked_consecutive = 0
+                    if require_fresh_step2 and not step2.ticket_urls:
+                        _send_error_alert(
+                            error_type="step2_fresh_failure",
+                            event_url=ev,
+                            debug_path=step2.debug_dir,
+                            details=f"status={step2.status}",
+                        )
                 event_id = db.upsert_event_record(
                     conn,
                     event_url=ev,
@@ -505,33 +749,30 @@ def run_discovery_mode(args: Any) -> int:
         elif stopped_early_blocked or (counts["step2_blocked"] > 0 and counts["ticket_types_fresh_upserted"] == 0):
             final_status = "verification_blocked_partial"
         db.finish_pipeline_run(conn, run_id=run_id, status=final_status, counts=counts, error_summary=None)
-        _send_telegram(
-            f"TicketSwap discovery finished ({scope_name}) events={counts['events_upserted']} "
-            f"fresh={counts['ticket_types_fresh_upserted']} fallback={counts['ticket_types_fallback_upserted']} "
-            f"blocked={counts['step2_blocked']} status={final_status}"
-        )
         if blocked_count >= 5:
-            _send_telegram(f"TicketSwap warning: verification_blocked occurred {blocked_count} times in discovery run.")
+            _send_error_alert(
+                error_type="verification_blocked_threshold_exceeded",
+                details=f"blocked_count={blocked_count} scope={scope_name}",
+            )
         if require_fresh_step2 and final_status == "verification_blocked":
-            _send_telegram(
-                "TicketSwap discovery blocked in require-fresh mode: no fresh STEP2 ticket URLs discovered."
+            _send_error_alert(
+                error_type="step2_fresh_failure",
+                details="require-fresh discovery ended with zero fresh ticket URLs",
             )
         if stopped_early_blocked:
-            _send_telegram(
-                f"TicketSwap discovery stopped early on VPS due to consecutive step2 blocks ({blocked_consecutive})."
-            )
-        elif final_status == "verification_blocked_partial":
-            _send_telegram(
-                "TicketSwap discovery ended with verification_blocked_partial (no new ticket types discovered)."
+            _send_error_alert(
+                error_type="verification_blocked_threshold_exceeded",
+                details=f"stopped_early consecutive_blocked={blocked_consecutive}",
             )
         if counts["ticket_types_fresh_upserted"] == 0:
             logging.warning("0 fresh ticket URLs discovered in this discovery run.")
+        _maybe_send_daily_outputs(conn, datetime.now(ZoneInfo(getattr(config, "LOCAL_TIMEZONE", "Europe/Amsterdam"))))
         print(json.dumps({"run_id": run_id, "mode": "discovery", "status": final_status, "counts": counts}, indent=2))
         print(f"CSV exports: {', '.join(str(p) for p in paths.values())}")
         return 3 if stopped_early_blocked else 0
     except Exception as exc:
         db.finish_pipeline_run(conn, run_id=run_id, status="failed", counts=counts, error_summary=str(exc))
-        _send_telegram(f"TicketSwap discovery failed ({scope_name}): {exc}")
+        _send_error_alert(error_type="pipeline_crash", details=f"discovery scope={scope_name} error={exc}")
         logging.exception("Discovery mode failed")
         return 2
     finally:
@@ -549,21 +790,40 @@ def _parse_iso_dt(value: Optional[str]) -> Optional[datetime]:
 
 def _monitoring_interval_hours(days_until_event: int) -> float:
     if days_until_event > 30:
-        return 72.0
-    if 7 <= days_until_event <= 30:
         return 24.0
+    if 8 <= days_until_event <= 30:
+        return 12.0
+    if days_until_event == 7:
+        return 8.0
     if days_until_event == 6:
         return 6.0
     if days_until_event == 5:
         return 24.0 / 5.0
     if days_until_event == 4:
         return 4.0
-    return 1.0
+    if days_until_event == 3:
+        return 3.0
+    if days_until_event in (1, 2):
+        return 24.0 / 10.0
+    if days_until_event == 0:
+        return 1.0
+    return 0.0
+
+
+def _event_start_hour_local(event_date_local: Optional[str], event_start_utc: Optional[str], tz: ZoneInfo) -> Optional[int]:
+    dt_utc = _parse_iso_dt(event_start_utc)
+    if dt_utc is not None:
+        return int(dt_utc.astimezone(tz).hour)
+    if event_date_local:
+        # If exact start is unknown, keep monitoring window open.
+        return int(getattr(config, "MONITOR_END_HOUR", 23))
+    return None
 
 
 def _ticket_due_now(
     *,
     event_date_local: Optional[str],
+    event_start_utc: Optional[str],
     last_scraped_utc: Optional[str],
     now_local: datetime,
     tz: ZoneInfo,
@@ -577,12 +837,22 @@ def _ticket_due_now(
     if not event_date_local:
         return True, "missing_event_date"
     try:
-        event_dt_local = datetime.fromisoformat(f"{event_date_local}T23:59:59").replace(tzinfo=tz)
+        event_date = date.fromisoformat(event_date_local)
     except ValueError:
         return True, "bad_event_date"
-    days_until_event = (event_dt_local.date() - now_local.date()).days
+
+    days_until_event = (event_date - now_local.date()).days
     if days_until_event < 0 and not monitor_after_event:
         return False, "past_event"
+
+    if days_until_event == 0:
+        event_start_hour = _event_start_hour_local(event_date_local, event_start_utc, tz)
+        if event_start_hour is not None and now_local.hour > event_start_hour and not monitor_after_event:
+            return False, "past_event"
+
+    if days_until_event < 0:
+        return True, "monitor_after_event"
+
     interval = _monitoring_interval_hours(days_until_event)
     if not last_scraped_utc:
         return True, "never_scraped"
@@ -592,6 +862,38 @@ def _ticket_due_now(
     last_local = last_dt_utc.astimezone(tz)
     due = (now_local - last_local) >= timedelta(hours=interval)
     return due, f"interval_{interval:.2f}h"
+
+
+def _total_available_quantity(snap: sm.MarketSnapshot) -> int:
+    qty = 0
+    for item in (snap.listings or []):
+        q = getattr(item, "quantity", None)
+        if isinstance(q, int):
+            qty += q
+    return qty
+
+
+def _ensure_snapshot_listings_payload(snap: sm.MarketSnapshot) -> None:
+    normalized: list[dict[str, Any]] = []
+    for item in (snap.listings or []):
+        href = getattr(item, "listing_href", None)
+        listing_id = None
+        if href:
+            tail = str(href).rstrip("/").split("/")[-1]
+            listing_id = "".join(ch for ch in tail if ch.isdigit()) or None
+        normalized.append(
+            {
+                "price": getattr(item, "price_per_ticket", None),
+                "quantity": getattr(item, "quantity", None),
+                "listing_url": href,
+                "listing_id": listing_id,
+            }
+        )
+    raw = dict(getattr(snap, "raw_debug", {}) or {})
+    raw["normalized_listings"] = normalized
+    raw["total_available_quantity"] = _total_available_quantity(snap)
+    raw["is_sold_out"] = bool(int(getattr(snap, "listing_count", 0) or 0) == 0)
+    object.__setattr__(snap, "raw_debug", raw)
 
 
 def run_monitoring_mode(args: Any) -> int:
@@ -627,6 +929,7 @@ def run_monitoring_mode(args: Any) -> int:
             last_scraped = str(last_row["scraped_at_utc"]) if last_row else None
             due, reason = _ticket_due_now(
                 event_date_local=r["event_date_local"],
+                event_start_utc=r["start_datetime_utc"],
                 last_scraped_utc=last_scraped,
                 now_local=now_local,
                 tz=tz,
@@ -656,6 +959,7 @@ def run_monitoring_mode(args: Any) -> int:
                         debug_dir=Path(config.DEBUG_DIR),
                         manual_wait=int(getattr(config, "MANUAL_VERIFY_WAIT_SECONDS", 90)) if args.headed else 0,
                     )
+                    _ensure_snapshot_listings_payload(snap)
                     db.insert_market_snapshot_for_ticket_type(
                         conn,
                         ticket_type_id=int(r["ticket_type_id"]),
@@ -672,21 +976,27 @@ def run_monitoring_mode(args: Any) -> int:
                         counts["scrape_no_data"] += 1
                     else:
                         counts["scrape_error"] += 1
+                        _send_error_alert(
+                            error_type="scrape_error",
+                            event_url=str(r["event_url"]),
+                            debug_path=str(Path(config.DEBUG_DIR)),
+                            details=snap.error_message,
+                        )
 
         paths = _export_mode_csvs(conn, Path("data/outputs"))
         db.finish_pipeline_run(conn, run_id=run_id, status="ok", counts=counts, error_summary=None)
-        _send_telegram(
-            f"TicketSwap monitoring finished due={counts['due_ticket_types']} "
-            f"ok={counts['scrape_ok']} blocked={counts['scrape_blocked']}"
-        )
         if blocked_count >= 5:
-            _send_telegram(f"TicketSwap warning: verification_blocked occurred {blocked_count} times in monitoring run.")
+            _send_error_alert(
+                error_type="verification_blocked_threshold_exceeded",
+                details=f"monitoring blocked_count={blocked_count}",
+            )
+        _maybe_send_daily_outputs(conn, now_local)
         print(json.dumps({"run_id": run_id, "mode": "monitoring", "status": "ok", "counts": counts}, indent=2))
         print(f"CSV exports: {', '.join(str(p) for p in paths.values())}")
         return 0
     except Exception as exc:
         db.finish_pipeline_run(conn, run_id=run_id, status="failed", counts=counts, error_summary=str(exc))
-        _send_telegram(f"TicketSwap monitoring failed: {exc}")
+        _send_error_alert(error_type="pipeline_crash", details=f"monitoring error={exc}")
         logging.exception("Monitoring mode failed")
         return 2
     finally:

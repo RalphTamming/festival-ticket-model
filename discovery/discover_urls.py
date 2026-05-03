@@ -29,6 +29,7 @@ import logging
 import random
 import re
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -1237,6 +1238,576 @@ def try_select_city_location_filter(driver, city_name: str) -> bool:
     except Exception:
         return False
 
+
+def _normalize_location_text(value: str) -> str:
+    t = unicodedata.normalize("NFKD", (value or ""))
+    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    t = re.sub(r"\s+", " ", t).strip().lower()
+    return t
+
+
+def _location_param_from_url(url: str) -> Optional[str]:
+    try:
+        q = parse_qs(urlparse(url).query)
+        v = (q.get("location") or [None])[0]
+        return str(v) if v is not None else None
+    except Exception:
+        return None
+
+
+def _dismiss_page_overlays(driver: Any) -> None:
+    try:
+        driver.execute_script(
+            r"""
+            const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+            const clickMatching = (want) => {
+              const nodes = Array.from(document.querySelectorAll('button, [role="button"]'));
+              for (const n of nodes) {
+                const t = norm(n.textContent || n.innerText || '');
+                const a = norm(n.getAttribute && n.getAttribute('aria-label'));
+                if (want && !(t.includes(want) || a.includes(want))) continue;
+                try { n.click(); } catch (e) {}
+              }
+            };
+            clickMatching('accept');
+            clickMatching('close');
+            clickMatching('not now');
+            """
+        )
+    except Exception:
+        pass
+
+
+def _wait_for_city_filter(driver: Any, timeout_seconds: float = 10.0) -> bool:
+    end = time.time() + max(0.5, float(timeout_seconds))
+    while time.time() < end:
+        try:
+            if bool(driver.execute_script("return !!document.querySelector('select#city-filter')")):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.25)
+    return False
+
+
+def _city_filter_options(driver: Any) -> list[dict[str, Any]]:
+    try:
+        out = driver.execute_script(
+            r"""
+            const sel = document.querySelector('select#city-filter');
+            if (!sel) return [];
+            return Array.from(sel.options || []).map(o => ({
+              value: String(o.value || ''),
+              text: String((o.textContent || '').trim()),
+              selected: !!o.selected
+            }));
+            """
+        )
+        if isinstance(out, list):
+            return [x for x in out if isinstance(x, dict)]
+    except Exception:
+        pass
+    return []
+
+
+def _selected_city_filter_text(driver: Any) -> Optional[str]:
+    try:
+        txt = driver.execute_script(
+            r"""
+            const sel = document.querySelector('select#city-filter');
+            if (!sel) return '';
+            const idx = sel.selectedIndex;
+            if (idx < 0 || idx >= sel.options.length) return '';
+            return String((sel.options[idx].textContent || '').trim());
+            """
+        )
+        out = str(txt or "").strip()
+        return out or None
+    except Exception:
+        return None
+
+
+def selected_location_text(driver_or_page: Any) -> Optional[str]:
+    return _selected_city_filter_text(driver_or_page)
+
+
+def _select_city_from_native_filter(driver: Any, city: str) -> tuple[bool, Optional[str]]:
+    n_city = _normalize_location_text(city)
+    for opt in _city_filter_options(driver):
+        txt = str(opt.get("text", ""))
+        val = str(opt.get("value", ""))
+        n_txt = _normalize_location_text(txt)
+        n_val = _normalize_location_text(val)
+        if not (n_txt == n_city or n_txt.startswith(n_city + ",") or n_val == n_city):
+            continue
+        try:
+            driver.execute_script(
+                r"""
+                const v = arguments[0];
+                const sel = document.querySelector('select#city-filter');
+                if (!sel) return false;
+                sel.value = v;
+                sel.dispatchEvent(new Event('input', {bubbles:true}));
+                sel.dispatchEvent(new Event('change', {bubbles:true}));
+                return true;
+                """,
+                val,
+            )
+            time.sleep(1.2)
+            return True, txt or val
+        except Exception:
+            return False, None
+    return False, None
+
+
+def _select_other_city_in_native_filter(driver: Any) -> bool:
+    try:
+        return bool(
+            driver.execute_script(
+                r"""
+                const sel = document.querySelector('select#city-filter');
+                if (!sel) return false;
+                const opts = Array.from(sel.options || []);
+                const m = opts.find(o => String(o.value || '').toLowerCase() === 'other')
+                  || opts.find(o => String((o.textContent || '').trim()).toLowerCase() === 'other city');
+                if (!m) return false;
+                sel.value = String(m.value || 'other');
+                sel.dispatchEvent(new Event('input', {bubbles:true}));
+                sel.dispatchEvent(new Event('change', {bubbles:true}));
+                return true;
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def _modal_root_selector() -> str:
+    return "dialog[open], [role='dialog'], .modal, [class*='modal']"
+
+
+def _wait_for_other_city_modal(driver: Any, timeout_seconds: float = 10.0) -> bool:
+    end = time.time() + max(0.5, float(timeout_seconds))
+    while time.time() < end:
+        try:
+            shown = bool(
+                driver.execute_script(
+                    r"""
+                    const roots = Array.from(document.querySelectorAll(arguments[0]));
+                    const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+                    for (const r of roots) {
+                      const t = norm(r.textContent || r.innerText || '');
+                      if (t.includes('other city')) return true;
+                    }
+                    return false;
+                    """,
+                    _modal_root_selector(),
+                )
+            )
+            if shown:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.25)
+    return False
+
+
+def _type_into_modal_search(driver: Any, query: str) -> bool:
+    q = (query or "").strip()
+    if not q:
+        return False
+    try:
+        from selenium.webdriver.common.by import By
+    except Exception:
+        By = None  # type: ignore
+    if By is not None:
+        try:
+            inputs = driver.find_elements(
+                By.CSS_SELECTOR,
+                "dialog[open] input[placeholder*='Search your city'], [role='dialog'] input[placeholder*='Search your city'], dialog[open] input[type='text'], [role='dialog'] input[type='text']",
+            )
+            if inputs:
+                inp = inputs[0]
+                inp.click()
+                with contextlib.suppress(Exception):
+                    inp.clear()
+                inp.send_keys(q)
+                time.sleep(0.25)
+                return True
+        except Exception:
+            pass
+    try:
+        return bool(
+            driver.execute_script(
+                r"""
+                const q = arguments[0];
+                const roots = Array.from(document.querySelectorAll(arguments[1]));
+                const normalize = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+                for (const r of roots) {
+                  const rt = normalize(r.textContent || r.innerText || '');
+                  if (!rt.includes('other city')) continue;
+                  const inputs = Array.from(r.querySelectorAll(
+                    "input[placeholder*='Search your city'], input[type='text'], dialog input, [role='dialog'] input, input"
+                  ));
+                  if (!inputs.length) continue;
+                  const input = inputs[0];
+                  try { input.focus(); } catch (e) {}
+                  input.value = '';
+                  input.dispatchEvent(new Event('input', {bubbles:true}));
+                  input.value = q;
+                  input.dispatchEvent(new Event('input', {bubbles:true}));
+                  input.dispatchEvent(new Event('change', {bubbles:true}));
+                  return true;
+                }
+                return false;
+                """,
+                q,
+                _modal_root_selector(),
+            )
+        )
+    except Exception:
+        return False
+
+
+def _collect_modal_suggestions(driver: Any) -> list[str]:
+    try:
+        out = driver.execute_script(
+            r"""
+            const roots = Array.from(document.querySelectorAll(arguments[0]));
+            const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+            const bad = new Set(['other city', 'search your city', 'close', 'x', 'cancel']);
+            for (const r of roots) {
+              const rt = norm(r.textContent || r.innerText || '').toLowerCase();
+              if (!rt.includes('other city')) continue;
+              const nodes = Array.from(r.querySelectorAll(
+                "[role='option'], li, button, div, a, [class*='option'], [class*='suggest']"
+              ));
+              const items = [];
+              for (const n of nodes) {
+                const txt = norm(n.textContent || n.innerText || '');
+                if (!txt || txt.length <= 2 || txt.length > 140) continue;
+                if (bad.has(txt.toLowerCase())) continue;
+                if ((txt.match(/,/g) || []).length > 1) continue;
+                if (!txt.includes(',')) continue;
+                const rect = n.getBoundingClientRect();
+                if (!(rect.width > 2 && rect.height > 2)) continue;
+                items.push(txt);
+              }
+              return Array.from(new Set(items)).slice(0, 80);
+            }
+            return [];
+            """,
+            _modal_root_selector(),
+        )
+        if isinstance(out, list):
+            return [str(x).strip() for x in out if str(x).strip()]
+    except Exception:
+        pass
+    return []
+
+
+def _pick_suggestion_index(
+    suggestions: list[str],
+    *,
+    city: str,
+    country: str,
+    expected_suggestion: Optional[str],
+) -> int:
+    if not suggestions:
+        return -1
+    n_city = _normalize_location_text(city)
+    n_country = _normalize_location_text(country)
+    n_expected = _normalize_location_text(expected_suggestion or "")
+    for i, s in enumerate(suggestions):
+        if n_expected and _normalize_location_text(s) == n_expected:
+            return i
+    for i, s in enumerate(suggestions):
+        n = _normalize_location_text(s)
+        if n.startswith(n_city + ",") and (not n_country or n_country in n):
+            return i
+    for i, s in enumerate(suggestions):
+        if _normalize_location_text(s) == n_city:
+            return i
+    return -1
+
+
+def _click_modal_suggestion(driver: Any, suggestion_text: str) -> bool:
+    target = _normalize_location_text(suggestion_text)
+    try:
+        return bool(
+            driver.execute_script(
+                r"""
+                const target = arguments[0];
+                const roots = Array.from(document.querySelectorAll(arguments[1]));
+                const normalize = (s) => {
+                  const ascii = String(s || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+                  return ascii.toLowerCase().replace(/\s+/g, ' ').trim();
+                };
+                for (const r of roots) {
+                  const rt = normalize(r.textContent || r.innerText || '');
+                  if (!rt.includes('other city')) continue;
+                  const nodes = Array.from(r.querySelectorAll("[role='option'], li, button, div, a"));
+                  for (const n of nodes) {
+                    const txt = String(n.textContent || n.innerText || '').trim();
+                    if (!txt || !txt.includes(',')) continue;
+                    if (normalize(txt) !== target) continue;
+                    const rect = n.getBoundingClientRect();
+                    if (!(rect.width > 2 && rect.height > 2)) continue;
+                    try { n.scrollIntoView({block:'center'}); n.click(); return true; } catch (e) {}
+                  }
+                }
+                return false;
+                """,
+                target,
+                _modal_root_selector(),
+            )
+        )
+    except Exception:
+        return False
+
+
+def _wait_modal_closed(driver: Any, timeout_seconds: float = 10.0) -> bool:
+    end = time.time() + max(0.5, float(timeout_seconds))
+    while time.time() < end:
+        try:
+            open_state = bool(
+                driver.execute_script(
+                    r"""
+                    const roots = Array.from(document.querySelectorAll(arguments[0]));
+                    const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+                    for (const r of roots) {
+                      const txt = norm(r.textContent || r.innerText || '');
+                      if (txt.includes('other city')) {
+                        const rect = r.getBoundingClientRect();
+                        if (rect.width > 2 && rect.height > 2) return true;
+                      }
+                    }
+                    return false;
+                    """,
+                    _modal_root_selector(),
+                )
+            )
+            if not open_state:
+                return True
+        except Exception:
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def _save_location_debug_state(
+    *,
+    driver: Any,
+    debug_dir: Optional[Path],
+    html_name: str,
+    png_name: str,
+    suggestions: Optional[list[str]] = None,
+) -> None:
+    if debug_dir is None:
+        return
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(Exception):
+        (debug_dir / html_name).write_text(driver.page_source or "", encoding="utf-8")
+    with contextlib.suppress(Exception):
+        driver.save_screenshot(str(debug_dir / png_name))
+    if suggestions is not None:
+        with contextlib.suppress(Exception):
+            (debug_dir / "suggestions.json").write_text(
+                json.dumps(suggestions, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+
+def _verify_location_selection(
+    *,
+    city: str,
+    country: str,
+    selected_suggestion: Optional[str],
+    selected_dropdown_text: Optional[str],
+    resulting_url: str,
+) -> bool:
+    n_city = _normalize_location_text(city)
+    n_country = _normalize_location_text(country)
+    n_sug = _normalize_location_text(selected_suggestion or "")
+    n_dd = _normalize_location_text(selected_dropdown_text or "")
+    if n_sug and n_sug.startswith(n_city + ",") and (not n_country or n_country in n_sug):
+        return True
+    if n_dd and (n_dd == n_city or n_dd.startswith(n_city + ",") or n_dd.startswith(n_city + " ")):
+        return True
+    return _location_param_from_url(resulting_url) is not None
+
+
+def select_location(
+    driver_or_page: Any,
+    location_name: str,
+    country_hint: Optional[str] = None,
+    expected_suggestion: Optional[str] = None,
+    debug_dir: Optional[Path] = None,
+) -> dict[str, Any]:
+    city = (location_name or "").strip()
+    country = (country_hint or "").strip()
+    expected = (expected_suggestion or f"{city}, {country}".strip(", ")).strip()
+    out = {
+        "success": False,
+        "city": city,
+        "country": country,
+        "expected_suggestion": expected,
+        "selected_suggestion": None,
+        "selected_dropdown_text": None,
+        "resulting_url": None,
+        "location_param": None,
+        "strategy_used": None,
+        "error_message": None,
+        "suggestions_available": [],
+        # backward-compatible keys
+        "requested_location": city,
+        "country_hint": country,
+        "selected_text": None,
+    }
+    if not city:
+        out["error_message"] = "empty_city"
+        return out
+    d = driver_or_page
+    _dismiss_page_overlays(d)
+    _save_location_debug_state(
+        driver=d,
+        debug_dir=debug_dir,
+        html_name="before.html",
+        png_name="screenshot_before.png",
+    )
+    if not _wait_for_city_filter(d, timeout_seconds=12):
+        out["error_message"] = "city_filter_not_found"
+        cur = normalize_url(getattr(d, "current_url", "") or "") or (getattr(d, "current_url", "") or "")
+        out["resulting_url"] = cur
+        out["location_param"] = _location_param_from_url(cur)
+        return out
+
+    ok_native, native_text = _select_city_from_native_filter(d, city)
+    prefer_modal_exact = bool(expected and "," in expected and ("," not in str(native_text or "")))
+    if ok_native and not prefer_modal_exact:
+        cur = normalize_url(getattr(d, "current_url", "") or "") or (getattr(d, "current_url", "") or "")
+        out["strategy_used"] = "native_select"
+        out["selected_dropdown_text"] = _selected_city_filter_text(d) or native_text
+        out["selected_text"] = out["selected_dropdown_text"]
+        if out["selected_dropdown_text"] and "," in out["selected_dropdown_text"]:
+            out["selected_suggestion"] = out["selected_dropdown_text"]
+        out["resulting_url"] = cur
+        out["location_param"] = _location_param_from_url(cur)
+        out["success"] = _verify_location_selection(
+            city=city,
+            country=country,
+            selected_suggestion=None,
+            selected_dropdown_text=out["selected_dropdown_text"],
+            resulting_url=cur,
+        )
+        if not out["success"]:
+            out["error_message"] = "native_selection_not_verified"
+        return out
+
+    if not _select_other_city_in_native_filter(d):
+        out["error_message"] = "other_city_option_not_found"
+        cur = normalize_url(getattr(d, "current_url", "") or "") or (getattr(d, "current_url", "") or "")
+        out["resulting_url"] = cur
+        out["location_param"] = _location_param_from_url(cur)
+        return out
+    if not _wait_for_other_city_modal(d, timeout_seconds=10):
+        out["error_message"] = "other_city_modal_not_found"
+        return out
+    _save_location_debug_state(
+        driver=d,
+        debug_dir=debug_dir,
+        html_name="after_other_city.html",
+        png_name="screenshot_modal.png",
+    )
+    if not _type_into_modal_search(d, city):
+        out["error_message"] = "modal_search_input_not_found"
+        return out
+    time.sleep(1.6)
+    suggestions = _collect_modal_suggestions(d)
+    out["suggestions_available"] = suggestions
+    _save_location_debug_state(
+        driver=d,
+        debug_dir=debug_dir,
+        html_name="after_typing.html",
+        png_name="screenshot_modal.png",
+        suggestions=suggestions,
+    )
+    idx = _pick_suggestion_index(
+        suggestions,
+        city=city,
+        country=country,
+        expected_suggestion=expected,
+    )
+    if idx < 0 and country:
+        if _type_into_modal_search(d, f"{city} {country}"):
+            time.sleep(1.3)
+            suggestions = _collect_modal_suggestions(d)
+            out["suggestions_available"] = suggestions
+            _save_location_debug_state(
+                driver=d,
+                debug_dir=debug_dir,
+                html_name="after_typing.html",
+                png_name="screenshot_modal.png",
+                suggestions=suggestions,
+            )
+            idx = _pick_suggestion_index(
+                suggestions,
+                city=city,
+                country=country,
+                expected_suggestion=expected,
+            )
+    if idx < 0:
+        out["error_message"] = "expected_suggestion_not_found"
+        cur = normalize_url(getattr(d, "current_url", "") or "") or (getattr(d, "current_url", "") or "")
+        out["resulting_url"] = cur
+        out["location_param"] = _location_param_from_url(cur)
+        return out
+    chosen = suggestions[idx]
+    if not _click_modal_suggestion(d, chosen):
+        out["error_message"] = "click_suggestion_failed"
+        return out
+    _wait_modal_closed(d, timeout_seconds=10)
+    time.sleep(1.4)
+    cur = normalize_url(getattr(d, "current_url", "") or "") or (getattr(d, "current_url", "") or "")
+    out["strategy_used"] = "modal_exact_suggestion"
+    out["selected_suggestion"] = chosen
+    out["selected_dropdown_text"] = _selected_city_filter_text(d) or selected_location_text(d)
+    out["selected_text"] = out["selected_dropdown_text"] or out["selected_suggestion"]
+    out["resulting_url"] = cur
+    out["location_param"] = _location_param_from_url(cur)
+    out["success"] = _verify_location_selection(
+        city=city,
+        country=country,
+        selected_suggestion=chosen,
+        selected_dropdown_text=out["selected_dropdown_text"],
+        resulting_url=cur,
+    )
+    if not out["success"]:
+        out["error_message"] = "selection_not_verified"
+    _save_location_debug_state(
+        driver=d,
+        debug_dir=debug_dir,
+        html_name="after_selection.html",
+        png_name="screenshot_after_selection.png",
+        suggestions=suggestions,
+    )
+    return out
+
+
+def select_location_exact(
+    driver_or_page: Any,
+    city: str,
+    country: str,
+    expected_suggestion: Optional[str] = None,
+    debug_dir: Optional[Path] = None,
+) -> dict[str, Any]:
+    return select_location(
+        driver_or_page,
+        city,
+        country_hint=country,
+        expected_suggestion=expected_suggestion,
+        debug_dir=debug_dir,
+    )
 
 def list_event_urls_from_category_listing(
     driver,
