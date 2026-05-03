@@ -13,6 +13,10 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 DISCOVERY_SCOPE="western_europe_festivals_verified"
 DISCOVERY_INTERVAL_SECONDS=86400
 RUN_DURATION_SECONDS=$((7 * 24 * 3600))
+# Cap per-city events at 30 (i.e. each listing URL in the scope contributes up
+# to 30 festivals/hubs per discovery run). All ticket types of every selected
+# festival are still extracted in full by STEP2.
+LIMIT_EVENTS_PER_CITY=30
 TZ_NAME="Europe/Amsterdam"
 SUMMARY_HOUR=23
 SUMMARY_MINUTE=30
@@ -237,12 +241,12 @@ run_discovery() {
     --mode discovery \
     --scope "$DISCOVERY_SCOPE" \
     --headed \
+    --limit-events "$LIMIT_EVENTS_PER_CITY" \
     --vps-safe-mode \
     --step2-browser selenium \
-    --step2-discovery-strategy selenium_slow_hydrate \
+    --step2-discovery-strategy shared_listing_click \
     --require-fresh-step2 \
-    --suppress-per-event-step2-alerts \
-    --wait-for-manual-verification 2>&1 | tee "$tmp_log"
+    --suppress-per-event-step2-alerts 2>&1 | tee "$tmp_log"
   local rc=${PIPESTATUS[0]}
   local out
   out="$(cat "$tmp_log")"

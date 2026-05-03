@@ -321,18 +321,27 @@ def main(argv: list[str]) -> int:
         (out_path.with_suffix(".summary.json")).write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         return 2
 
+    # See pipeline.mode_runner._run_step1_events for the same pattern.
+    # Listing tiles often link to hubs (/festival-tickets/a/<slug>) instead of
+    # event pages; STEP2 handles both shapes, so include both here.
     events: list[str] = []
+    hubs: list[str] = []
     mode = ""
     for ln in (p.stdout or "").splitlines():
-        if ln.strip() == "EVENT_URLS":
+        s = ln.strip()
+        if s == "EVENT_URLS":
             mode = "events"
             continue
-        if ln.strip() == "HUB_URLS":
+        if s == "HUB_URLS":
             mode = "hubs"
             continue
-        if mode == "events" and ln.strip().startswith("https://www.ticketswap.com/festival-tickets/") and "/festival-tickets/a/" not in ln:
-            events.append(ln.strip())
-    events = list(dict.fromkeys(events))[: int(args.limit_events)]
+        if not s.startswith("https://www.ticketswap.com/festival-tickets/"):
+            continue
+        if mode == "events" and "/festival-tickets/a/" not in s:
+            events.append(s)
+        elif mode == "hubs" and "/festival-tickets/a/" in s:
+            hubs.append(s)
+    events = list(dict.fromkeys(events + hubs))[: int(args.limit_events)]
 
     _append_jsonl(
         out_path,
