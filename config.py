@@ -91,6 +91,7 @@ MONITOR_AFTER_EVENT = str(os.getenv("MONITOR_AFTER_EVENT", "false")).lower() in 
 DAILY_REPORT_TIME = os.getenv("DAILY_REPORT_TIME", "21:00")
 ENABLE_WEEKLY_EXPORT = str(os.getenv("ENABLE_WEEKLY_EXPORT", "true")).lower() in ("1", "true", "yes", "on")
 TELEGRAM_ERROR_ONLY_MODE = str(os.getenv("TELEGRAM_ERROR_ONLY_MODE", "false")).lower() in ("1", "true", "yes", "on")
+STEP2_DISCOVERY_STRATEGY = os.getenv("STEP2_DISCOVERY_STRATEGY", "hybrid_fast").strip().lower()
 
 LOCATION_CACHE_PATH = Path(os.getenv("LOCATION_CACHE_PATH", "data/location_cache.json"))
 LOCATION_CACHE_MAX_AGE_DAYS = int(os.getenv("LOCATION_CACHE_MAX_AGE_DAYS", "30"))

@@ -250,7 +250,7 @@ def new_driver(*, headless: bool, extra_args: Optional[Sequence[str]] = None) ->
     # undetected-chromedriver can occasionally race on Windows when patching the driver binary.
     # A small retry makes the pipeline much more reliable.
     last_err: Optional[Exception] = None
-    for _ in range(3):
+    for _ in range(5):
         try:
             return uc.Chrome(**_build_kw())
         except FileExistsError as e:
@@ -262,6 +262,11 @@ def new_driver(*, headless: bool, extra_args: Optional[Sequence[str]] = None) ->
             if "session not created" in msg or "chrome not reachable" in msg:
                 last_err = e
                 time.sleep(1.2)
+                continue
+            if "remote end closed connection without response" in msg or "connection aborted" in msg:
+                # Seen under UC startup contention/network race when spawning local driver service.
+                last_err = e
+                time.sleep(1.5)
                 continue
             raise
     assert last_err is not None

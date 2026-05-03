@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import csv
 import json
 import logging
@@ -22,8 +23,11 @@ import db
 from discovery import discover_urls as du
 from discovery.step2_discover_ticket_urls import (
     Step2Result,
+    classify_loaded_selenium_page,
+    discover_ticket_urls_from_event_selenium_embedded_only,
     discover_ticket_urls_from_event_playwright,
     discover_ticket_urls_from_event_selenium,
+    extract_ticket_urls_from_loaded_selenium_page,
 )
 from scraping import scrape_market as sm
 
@@ -318,6 +322,214 @@ def _run_step1_events(listing_url: str, *, limit_events: int, headless: bool) ->
     return list(dict.fromkeys(events))[: int(limit_events)]
 
 
+def _save_shared_step2_debug(
+    *,
+    event_url: str,
+    status: str,
+    classification: str,
+    current_url: str,
+    html: str,
+    visible_text: str,
+    ticket_urls: list[str],
+    counts: dict[str, int],
+    screenshot_writer: Optional[Any],
+) -> str:
+    slug = _event_slug(event_url)
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    out = Path(config.DEBUG_DIR) / "step2_shared_listing_click" / f"{slug}_{ts}"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "event_url.txt").write_text(event_url or "", encoding="utf-8")
+    (out / "current_url.txt").write_text(current_url or "", encoding="utf-8")
+    (out / "status.txt").write_text(status, encoding="utf-8")
+    (out / "classification.txt").write_text(classification, encoding="utf-8")
+    (out / "page.html").write_text(html or "", encoding="utf-8")
+    (out / "visible_text.txt").write_text(visible_text or "", encoding="utf-8")
+    (out / "ticket_urls.txt").write_text("\n".join(ticket_urls), encoding="utf-8")
+    (out / "extraction_debug.json").write_text(
+        json.dumps({"counts": counts, "ticket_urls_found": len(ticket_urls), "ticket_urls": ticket_urls}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    if screenshot_writer is not None:
+        with contextlib.suppress(Exception):
+            screenshot_writer(str(out / "screenshot.png"))
+    return str(out)
+
+
+def _collect_listing_event_urls_live(driver: Any, listing_url: str, *, limit_events: int) -> list[str]:
+    html = driver.page_source or ""
+    hrefs = sorted(du.merge_link_candidates(html, driver, base_url=listing_url))
+    out: list[str] = []
+    for h in hrefs:
+        n = du.normalize_url(h)
+        if not n:
+            continue
+        if not du.is_event_page(n):
+            continue
+        if du.is_festival_page(n) or du.is_ticket_url(n):
+            continue
+        if n in out:
+            continue
+        out.append(n)
+        if len(out) >= int(limit_events):
+            break
+    return out
+
+
+def _click_event_link_on_listing(driver: Any, event_url: str) -> bool:
+    target = du.normalize_url(event_url) or event_url
+    if not target:
+        return False
+    try:
+        from selenium.webdriver.common.by import By
+    except Exception:
+        By = None  # type: ignore
+    if By is not None:
+        with contextlib.suppress(Exception):
+            anchors = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+            for a in anchors:
+                href = du.normalize_url(a.get_attribute("href") or "") or ""
+                if href != target:
+                    continue
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", a)
+                time.sleep(0.25)
+                driver.execute_script("arguments[0].click();", a)
+                return True
+    with contextlib.suppress(Exception):
+        return bool(
+            driver.execute_script(
+                """
+                const target = arguments[0];
+                const as = Array.from(document.querySelectorAll('a[href]'));
+                for (const a of as) {
+                  const href = a.href || a.getAttribute('href') || '';
+                  if (href !== target) continue;
+                  try { a.scrollIntoView({block:'center'}); a.click(); return true; } catch (e) {}
+                }
+                return false;
+                """,
+                target,
+            )
+        )
+    return False
+
+
+def _discover_shared_listing_click(
+    *,
+    listing_url: str,
+    limit_events: int,
+    headed: bool,
+    debug: bool,
+    max_consecutive_blocked: int = 2,
+) -> list[tuple[str, Step2Result]]:
+    """
+    Shared-session STEP2 strategy: one browser for listing -> click event -> parse -> back.
+    """
+    results: list[tuple[str, Step2Result]] = []
+    driver = du.new_driver(headless=not headed)
+    blocked_streak = 0
+    try:
+        driver.set_page_load_timeout(90)
+        driver.get("https://www.ticketswap.com/")
+        time.sleep(random.uniform(8.0, 12.0))
+        driver.get(listing_url)
+        du.wait_for_page_content(driver, headless=not headed)
+        time.sleep(random.uniform(8.0, 15.0))
+        du.scroll_for_lazy_content(driver)
+        time.sleep(random.uniform(2.0, 5.0))
+        event_urls: list[str] = []
+        for _ in range(4):
+            for ev in _collect_listing_event_urls_live(driver, listing_url, limit_events=limit_events):
+                if ev not in event_urls:
+                    event_urls.append(ev)
+            if len(event_urls) >= int(limit_events):
+                break
+            with contextlib.suppress(Exception):
+                du.expand_category_listing_show_more(driver, listing_url, "festival-tickets", max_clicks=2)
+            du.scroll_for_lazy_content(driver)
+            time.sleep(random.uniform(2.0, 5.0))
+        event_urls = event_urls[: int(limit_events)]
+        if not event_urls:
+            with contextlib.suppress(Exception):
+                event_urls = _run_step1_events(listing_url, limit_events=limit_events, headless=not headed)
+        listing_anchor = str(getattr(driver, "current_url", "") or listing_url)
+        for ev in event_urls:
+            clicked = _click_event_link_on_listing(driver, ev)
+            if not clicked:
+                driver.get(ev)
+            time.sleep(random.uniform(10.0, 20.0))
+            du.scroll_for_lazy_content(driver)
+            html = driver.page_source or ""
+            visible = ""
+            with contextlib.suppress(Exception):
+                visible = str(driver.execute_script("return document.body && document.body.innerText") or "")
+            current_url = str(getattr(driver, "current_url", "") or ev)
+            classification = classify_loaded_selenium_page(current_url=current_url, html=html, visible_text=visible)
+            if classification in ("401_or_forbidden", "verification_page"):
+                step2 = Step2Result(du.normalize_url(ev) or ev, "blocked", True, "shared_listing_click", [], debug_dir=None)
+                blocked_streak += 1
+                if debug:
+                    dbg = _save_shared_step2_debug(
+                        event_url=ev,
+                        status=step2.status,
+                        classification=classification,
+                        current_url=current_url,
+                        html=html,
+                        visible_text=visible,
+                        ticket_urls=[],
+                        counts={},
+                        screenshot_writer=getattr(driver, "save_screenshot", None),
+                    )
+                    step2 = Step2Result(step2.event_url, step2.status, step2.verification, step2.strategy, step2.ticket_urls, debug_dir=dbg)
+            elif classification == "404":
+                step2 = Step2Result(du.normalize_url(ev) or ev, "no_data", False, "shared_listing_click", [], debug_dir=None)
+                blocked_streak = 0
+                if debug:
+                    dbg = _save_shared_step2_debug(
+                        event_url=ev,
+                        status=step2.status,
+                        classification=classification,
+                        current_url=current_url,
+                        html=html,
+                        visible_text=visible,
+                        ticket_urls=[],
+                        counts={},
+                        screenshot_writer=getattr(driver, "save_screenshot", None),
+                    )
+                    step2 = Step2Result(step2.event_url, step2.status, step2.verification, step2.strategy, step2.ticket_urls, debug_dir=dbg)
+            else:
+                ticket_urls, counts = extract_ticket_urls_from_loaded_selenium_page(driver, event_url=ev)
+                status = "ok" if ticket_urls else "no_data"
+                step2 = Step2Result(du.normalize_url(ev) or ev, status, False, "shared_listing_click", ticket_urls, debug_dir=None)
+                blocked_streak = 0
+                if debug and status != "ok":
+                    dbg = _save_shared_step2_debug(
+                        event_url=ev,
+                        status=step2.status,
+                        classification=classification,
+                        current_url=current_url,
+                        html=html,
+                        visible_text=visible,
+                        ticket_urls=ticket_urls,
+                        counts=counts,
+                        screenshot_writer=getattr(driver, "save_screenshot", None),
+                    )
+                    step2 = Step2Result(step2.event_url, step2.status, step2.verification, step2.strategy, step2.ticket_urls, debug_dir=dbg)
+            results.append((ev, step2))
+            if blocked_streak >= int(max_consecutive_blocked):
+                break
+            with contextlib.suppress(Exception):
+                driver.back()
+                time.sleep(random.uniform(2.0, 4.0))
+                if not str(getattr(driver, "current_url", "") or "").startswith(listing_anchor):
+                    driver.get(listing_anchor)
+                    time.sleep(random.uniform(2.0, 4.0))
+            time.sleep(random.uniform(2.0, 6.0))
+    finally:
+        with contextlib.suppress(Exception):
+            driver.quit()
+    return results
+
+
 def _discover_live_with_retry(
     event_url: str,
     *,
@@ -328,6 +540,7 @@ def _discover_live_with_retry(
     wait_for_manual_verification: bool,
     manual_verification_timeout: int,
     retries: int,
+    strategy: str,
     blocked_sleep_min: int,
     blocked_sleep_max: int,
     page_timeout_ms: int,
@@ -343,17 +556,42 @@ def _discover_live_with_retry(
             _jitter(float(blocked_sleep_min), float(max(blocked_sleep_min, blocked_sleep_max)))
         try:
             order: list[str]
-            b = str(browser or "auto")
-            if b == "selenium":
-                order = ["selenium", "playwright"]
-            elif b == "playwright":
-                order = ["playwright", "selenium"]
+            strategy_norm = str(strategy or "").strip().lower()
+            if strategy_norm == "selenium_embedded_only":
+                order = ["selenium_embedded_only"]
+            elif strategy_norm == "selenium_slow_hydrate":
+                order = ["selenium"]
+            elif strategy_norm == "playwright_network":
+                order = ["playwright"]
+            elif strategy_norm == "hybrid_fast":
+                order = ["selenium_embedded_only", "playwright"]
+            elif strategy_norm == "hybrid_safe":
+                order = ["selenium_embedded_only", "selenium", "playwright"]
+            elif strategy_norm == "shared_listing_click":
+                # handled at listing-session level in run_discovery_mode
+                order = ["selenium"]
             else:
-                order = ["selenium", "playwright"]
+                b = str(browser or "auto")
+                if b == "selenium":
+                    order = ["selenium", "playwright"]
+                elif b == "playwright":
+                    order = ["playwright", "selenium"]
+                else:
+                    order = ["selenium", "playwright"]
 
             res = Step2Result(du.normalize_url(event_url) or event_url, "no_data", False, "none", [], debug_dir=None)
             for strategy in order:
-                if strategy == "selenium":
+                if strategy == "selenium_embedded_only":
+                    cand = discover_ticket_urls_from_event_selenium_embedded_only(
+                        event_url,
+                        headed=bool(headed),
+                        debug=bool(debug),
+                        verification_wait_seconds=int(verification_wait_seconds),
+                        debug_root="step2_vps_live",
+                        wait_for_manual_verification=bool(wait_for_manual_verification),
+                        manual_verification_timeout=int(manual_verification_timeout),
+                    )
+                elif strategy == "selenium":
                     cand = discover_ticket_urls_from_event_selenium(
                         event_url,
                         headed=bool(headed),
@@ -606,6 +844,10 @@ def run_discovery_mode(args: Any) -> int:
     verification_wait = int(getattr(args, "step2_verification_wait", 60))
     wait_for_manual_verification = bool(getattr(args, "wait_for_manual_verification", False))
     require_fresh_step2 = bool(getattr(args, "require_fresh_step2", False))
+    suppress_per_event_step2_alerts = bool(getattr(args, "suppress_per_event_step2_alerts", False))
+    configured_strategy = str(getattr(args, "step2_discovery_strategy", "") or "").strip().lower()
+    if not configured_strategy:
+        configured_strategy = str(getattr(config, "STEP2_DISCOVERY_STRATEGY", "hybrid_fast") or "hybrid_fast").strip().lower()
     browser_pref = str(getattr(args, "step2_browser", "auto"))
     if safe_mode and browser_pref == "auto":
         browser_pref = "selenium"
@@ -625,120 +867,158 @@ def run_discovery_mode(args: Any) -> int:
         "ticket_types_fresh_upserted": 0,
         "ticket_types_fallback_upserted": 0,
         "stopped_early_blocked": 0,
+        "step2_no_fresh": 0,
     }
+    step2_fresh_fail_event_urls: list[str] = []
+    step2_fresh_fail_debug_dirs: set[str] = set()
+
+    def _handle_event_step2(ev: str, step2: Step2Result) -> bool:
+        nonlocal blocked_count, blocked_consecutive, stopped_early_blocked
+        slug = _event_slug(ev)
+        if step2.status == "blocked":
+            blocked_count += 1
+            counts["step2_blocked"] += 1
+            counts["step2_no_fresh"] += 1
+            blocked_consecutive += 1
+            step2_fresh_fail_event_urls.append(ev)
+            if step2.debug_dir:
+                step2_fresh_fail_debug_dirs.add(step2.debug_dir)
+            if require_fresh_step2 and (not suppress_per_event_step2_alerts):
+                _send_error_alert(
+                    error_type="step2_fresh_failure",
+                    event_url=ev,
+                    debug_path=step2.debug_dir,
+                    details="verification_blocked during require-fresh discovery",
+                )
+        elif step2.status == "ok" and step2.ticket_urls:
+            counts["step2_fresh_ok"] += 1
+            blocked_consecutive = 0
+        elif step2.status == "error":
+            counts["step2_errors"] += 1
+            counts["step2_no_fresh"] += 1
+            blocked_consecutive = 0
+            step2_fresh_fail_event_urls.append(ev)
+            if step2.debug_dir:
+                step2_fresh_fail_debug_dirs.add(step2.debug_dir)
+            _send_error_alert(
+                error_type="step2_error",
+                event_url=ev,
+                debug_path=step2.debug_dir,
+                details=step2.status,
+            )
+        else:
+            blocked_consecutive = 0
+            counts["step2_no_fresh"] += 1
+            step2_fresh_fail_event_urls.append(ev)
+            if step2.debug_dir:
+                step2_fresh_fail_debug_dirs.add(step2.debug_dir)
+            if require_fresh_step2 and (not suppress_per_event_step2_alerts):
+                _send_error_alert(
+                    error_type="step2_fresh_failure",
+                    event_url=ev,
+                    debug_path=step2.debug_dir,
+                    details=f"status={step2.status}",
+                )
+
+        event_id = db.upsert_event_record(
+            conn,
+            event_url=ev,
+            event_slug=slug,
+            event_name=_slug_to_name(slug),
+            event_date_local=_extract_event_date_local_from_slug(slug),
+            category=config.SCOPES.get(scope_name, {}).get("category", "festival"),
+            location=_extract_location_from_slug(slug) or "Amsterdam",
+            country="Netherlands",
+            region="Western Europe",
+            status="active",
+        )
+        counts["events_upserted"] += 1
+        ticket_urls_for_event = list(step2.ticket_urls)
+        is_fallback = False
+        if (not require_fresh_step2) and step2.status == "blocked" and not ticket_urls_for_event:
+            known = db.list_ticket_urls_for_event(conn, event_url=ev)
+            if known:
+                ticket_urls_for_event = known
+                is_fallback = True
+                counts["step2_db_fallback_used"] += 1
+                logging.warning("STEP2 blocked for %s; reusing %d DB ticket URLs", ev, len(ticket_urls_for_event))
+        elif (not require_fresh_step2) and step2.status in ("no_data", "error") and not ticket_urls_for_event:
+            known = db.list_ticket_urls_for_event(conn, event_url=ev)
+            if known:
+                ticket_urls_for_event = known
+                is_fallback = True
+                counts["step2_db_fallback_used"] += 1
+                logging.warning(
+                    "STEP2 %s for %s; reusing %d DB ticket URLs",
+                    step2.status,
+                    ev,
+                    len(ticket_urls_for_event),
+                )
+        for tu in ticket_urls_for_event:
+            t_slug, t_label = du.ticket_type_from_ticket_url(tu)
+            db.upsert_ticket_type_record(
+                conn,
+                ticket_url=tu,
+                event_id=event_id,
+                event_url=ev,
+                ticket_type_slug=t_slug,
+                ticket_type_label=t_label,
+                status="active",
+            )
+            if is_fallback:
+                counts["ticket_types_fallback_upserted"] += 1
+            else:
+                counts["ticket_types_fresh_upserted"] += 1
+
+        if blocked_consecutive > stop_threshold:
+            stopped_early_blocked = True
+            counts["stopped_early_blocked"] = 1
+            logging.warning(
+                "Stopping discovery early due to consecutive verification blocks (%d > %d)",
+                blocked_consecutive,
+                stop_threshold,
+            )
+            return True
+        return False
+
     try:
         for listing_url in listing_urls:
-            events = _run_step1_events(listing_url, limit_events=args.limit_events, headless=headless)
-            counts["events_collected"] += len(events)
-            for ev in events:
-                slug = _event_slug(ev)
-                _jitter(inter_event_min, inter_event_max)
-                step2, _, _, _verification_seen = _discover_live_with_retry(
-                    ev,
+            if configured_strategy == "shared_listing_click":
+                shared_results = _discover_shared_listing_click(
+                    listing_url=listing_url,
+                    limit_events=int(args.limit_events),
                     headed=bool(args.headed),
                     debug=bool(args.debug),
-                    browser=browser_pref,
-                    verification_wait_seconds=verification_wait,
-                    wait_for_manual_verification=wait_for_manual_verification,
-                    manual_verification_timeout=300,
-                    retries=retries,
-                    blocked_sleep_min=blocked_sleep_min,
-                    blocked_sleep_max=blocked_sleep_max,
-                    page_timeout_ms=page_timeout_ms,
-                    pre_network_wait_ms=pre_network_wait_ms,
-                    post_network_wait_ms=post_network_wait_ms,
+                    max_consecutive_blocked=2,
                 )
-                if step2.status == "blocked":
-                    blocked_count += 1
-                    counts["step2_blocked"] += 1
-                    blocked_consecutive += 1
-                    if require_fresh_step2:
-                        _send_error_alert(
-                            error_type="step2_fresh_failure",
-                            event_url=ev,
-                            debug_path=step2.debug_dir,
-                            details="verification_blocked during require-fresh discovery",
-                        )
-                elif step2.status == "ok" and step2.ticket_urls:
-                    counts["step2_fresh_ok"] += 1
-                    blocked_consecutive = 0
-                elif step2.status == "error":
-                    counts["step2_errors"] += 1
-                    blocked_consecutive = 0
-                    _send_error_alert(
-                        error_type="step2_error",
-                        event_url=ev,
-                        debug_path=step2.debug_dir,
-                        details=step2.status,
+                counts["events_collected"] += len(shared_results)
+                for ev, step2 in shared_results:
+                    _jitter(inter_event_min, inter_event_max)
+                    if _handle_event_step2(ev, step2):
+                        break
+            else:
+                events = _run_step1_events(listing_url, limit_events=args.limit_events, headless=headless)
+                counts["events_collected"] += len(events)
+                for ev in events:
+                    _jitter(inter_event_min, inter_event_max)
+                    step2, _, _, _verification_seen = _discover_live_with_retry(
+                        ev,
+                        headed=bool(args.headed),
+                        debug=bool(args.debug),
+                        browser=browser_pref,
+                        verification_wait_seconds=verification_wait,
+                        wait_for_manual_verification=wait_for_manual_verification,
+                        manual_verification_timeout=300,
+                        retries=retries,
+                        strategy=configured_strategy,
+                        blocked_sleep_min=blocked_sleep_min,
+                        blocked_sleep_max=blocked_sleep_max,
+                        page_timeout_ms=page_timeout_ms,
+                        pre_network_wait_ms=pre_network_wait_ms,
+                        post_network_wait_ms=post_network_wait_ms,
                     )
-                else:
-                    blocked_consecutive = 0
-                    if require_fresh_step2 and not step2.ticket_urls:
-                        _send_error_alert(
-                            error_type="step2_fresh_failure",
-                            event_url=ev,
-                            debug_path=step2.debug_dir,
-                            details=f"status={step2.status}",
-                        )
-                event_id = db.upsert_event_record(
-                    conn,
-                    event_url=ev,
-                    event_slug=slug,
-                    event_name=_slug_to_name(slug),
-                    event_date_local=_extract_event_date_local_from_slug(slug),
-                    category=config.SCOPES.get(scope_name, {}).get("category", "festival"),
-                    location=_extract_location_from_slug(slug) or "Amsterdam",
-                    country="Netherlands",
-                    region="Western Europe",
-                    status="active",
-                )
-                counts["events_upserted"] += 1
-                ticket_urls_for_event = list(step2.ticket_urls)
-                is_fallback = False
-                if (not require_fresh_step2) and step2.status == "blocked" and not ticket_urls_for_event:
-                    known = db.list_ticket_urls_for_event(conn, event_url=ev)
-                    if known:
-                        ticket_urls_for_event = known
-                        is_fallback = True
-                        counts["step2_db_fallback_used"] += 1
-                        logging.warning("STEP2 blocked for %s; reusing %d DB ticket URLs", ev, len(ticket_urls_for_event))
-                elif (not require_fresh_step2) and step2.status in ("no_data", "error") and not ticket_urls_for_event:
-                    known = db.list_ticket_urls_for_event(conn, event_url=ev)
-                    if known:
-                        ticket_urls_for_event = known
-                        is_fallback = True
-                        counts["step2_db_fallback_used"] += 1
-                        logging.warning(
-                            "STEP2 %s for %s; reusing %d DB ticket URLs",
-                            step2.status,
-                            ev,
-                            len(ticket_urls_for_event),
-                        )
-
-                for tu in ticket_urls_for_event:
-                    t_slug, t_label = du.ticket_type_from_ticket_url(tu)
-                    db.upsert_ticket_type_record(
-                        conn,
-                        ticket_url=tu,
-                        event_id=event_id,
-                        event_url=ev,
-                        ticket_type_slug=t_slug,
-                        ticket_type_label=t_label,
-                        status="active",
-                    )
-                    if is_fallback:
-                        counts["ticket_types_fallback_upserted"] += 1
-                    else:
-                        counts["ticket_types_fresh_upserted"] += 1
-                if blocked_consecutive > stop_threshold:
-                    stopped_early_blocked = True
-                    counts["stopped_early_blocked"] = 1
-                    logging.warning(
-                        "Stopping discovery early due to consecutive verification blocks (%d > %d)",
-                        blocked_consecutive,
-                        stop_threshold,
-                    )
-                    break
+                    if _handle_event_step2(ev, step2):
+                        break
             if stopped_early_blocked:
                 break
 
@@ -749,20 +1029,35 @@ def run_discovery_mode(args: Any) -> int:
         elif stopped_early_blocked or (counts["step2_blocked"] > 0 and counts["ticket_types_fresh_upserted"] == 0):
             final_status = "verification_blocked_partial"
         db.finish_pipeline_run(conn, run_id=run_id, status=final_status, counts=counts, error_summary=None)
-        if blocked_count >= 5:
+        if blocked_count >= 5 and (not suppress_per_event_step2_alerts):
             _send_error_alert(
                 error_type="verification_blocked_threshold_exceeded",
                 details=f"blocked_count={blocked_count} scope={scope_name}",
             )
-        if require_fresh_step2 and final_status == "verification_blocked":
+        if require_fresh_step2 and final_status == "verification_blocked" and (not suppress_per_event_step2_alerts):
             _send_error_alert(
                 error_type="step2_fresh_failure",
                 details="require-fresh discovery ended with zero fresh ticket URLs",
             )
-        if stopped_early_blocked:
+        if stopped_early_blocked and (not suppress_per_event_step2_alerts):
             _send_error_alert(
                 error_type="verification_blocked_threshold_exceeded",
                 details=f"stopped_early consecutive_blocked={blocked_consecutive}",
+            )
+        if suppress_per_event_step2_alerts and require_fresh_step2 and step2_fresh_fail_event_urls:
+            top_failed = step2_fresh_fail_event_urls[:10]
+            debug_root = ", ".join(sorted(step2_fresh_fail_debug_dirs)[:3]) if step2_fresh_fail_debug_dirs else "data/debug/step2_vps_live"
+            summary_lines = [
+                f"events_tested={counts.get('events_upserted', 0)}",
+                f"fresh_success={counts.get('step2_fresh_ok', 0)}",
+                f"blocked={counts.get('step2_blocked', 0)}",
+                f"no_fresh_ticket={counts.get('step2_no_fresh', 0)}",
+                f"failed_events_top10={top_failed}",
+                f"debug_dir={debug_root}",
+            ]
+            _send_error_alert(
+                error_type="step2_fresh_failure_aggregated",
+                details="; ".join(summary_lines),
             )
         if counts["ticket_types_fresh_upserted"] == 0:
             logging.warning("0 fresh ticket URLs discovered in this discovery run.")

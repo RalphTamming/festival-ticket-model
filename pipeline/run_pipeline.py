@@ -120,6 +120,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Discovery mode: disable DB fallback; fail discovery status if fresh STEP2 is blocked.",
     )
     p.add_argument(
+        "--suppress-per-event-step2-alerts",
+        action="store_true",
+        default=False,
+        help="Discovery mode: suppress per-event fresh STEP2 Telegram alerts and send one aggregated alert at end.",
+    )
+    p.add_argument(
+        "--step2-discovery-strategy",
+        choices=["selenium_embedded_only", "selenium_slow_hydrate", "playwright_network", "hybrid_fast", "hybrid_safe", "shared_listing_click"],
+        default=None,
+        help="Discovery mode: strategy profile for fresh STEP2 discovery.",
+    )
+    p.add_argument(
         "--out",
         default="data/outputs/pipeline_run.jsonl",
         help="Output JSONL path (parent dirs are created).",

@@ -239,7 +239,9 @@ run_discovery() {
     --headed \
     --vps-safe-mode \
     --step2-browser selenium \
+    --step2-discovery-strategy selenium_slow_hydrate \
     --require-fresh-step2 \
+    --suppress-per-event-step2-alerts \
     --wait-for-manual-verification 2>&1 | tee "$tmp_log"
   local rc=${PIPESTATUS[0]}
   local out

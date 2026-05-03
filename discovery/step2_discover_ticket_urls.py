@@ -120,12 +120,62 @@ def _write_step2_artifacts(
 
 def _is_verification_text(text: str) -> bool:
     t = (text or "").lower()
-    return "unable to verify" in t or "verifying" in t
+    return "unable to verify" in t or "verifying" in t or 'iframe src="/401"' in t
 
 
 def _looks_like_404(text: str) -> bool:
     t = (text or "").lower()
     return "hmm, 404" in t or "we’re a bit lost" in t or "we're a bit lost" in t or "couldn’t find that page" in t or "couldn't find that page" in t
+
+
+def classify_loaded_selenium_page(
+    *,
+    current_url: str,
+    html: str,
+    visible_text: str,
+) -> str:
+    cur = (current_url or "").lower()
+    txt = f"{html}\n{visible_text}".lower()
+    if "/401" in cur or 'iframe src="/401"' in txt or "forbidden" in txt or "unauthorized" in txt:
+        return "401_or_forbidden"
+    if du.is_blocked_for_discovery(html) or du.looks_like_verification(html) or _is_verification_text(visible_text):
+        return "verification_page"
+    if _looks_like_404(visible_text or html):
+        return "404"
+    if "ticket" in txt or "tickets" in txt or "wanted" in txt or "available" in txt:
+        return "real_event_page"
+    return "unknown"
+
+
+def extract_ticket_urls_from_loaded_selenium_page(
+    driver: Any,
+    *,
+    event_url: str,
+) -> tuple[list[str], dict[str, int]]:
+    ev = du.normalize_url(event_url) or event_url
+    revealed = du.reveal_event_page_deep_links(driver, ev)
+    html = driver.page_source or ""
+    merged = du.merge_link_candidates(html, driver, ev)
+    merged |= revealed
+    tickets: set[str] = set()
+    for u in merged:
+        nu = du.normalize_url(u)
+        if not nu or not du.is_ticket_url(nu):
+            continue
+        eu = du.normalize_url(du.event_url_from_ticket_url(nu) or "")
+        if eu == ev:
+            tickets.add(nu)
+    cache_tickets = du.extract_ticket_urls_from_eventtype_cache(html, base_url=ev)
+    for tu in cache_tickets:
+        nu = du.normalize_url(tu)
+        if nu and du.normalize_url(du.event_url_from_ticket_url(nu) or "") == ev:
+            tickets.add(nu)
+    counts = {
+        "merge_candidates_count": len(merged),
+        "eventtype_cache_count": len(cache_tickets),
+        "revealed_count": len(revealed),
+    }
+    return sorted(tickets), counts
 
 
 def _wait_for_manual_verification_selenium(
@@ -556,33 +606,9 @@ def discover_ticket_urls_from_event_selenium(
         du.scroll_for_lazy_content(driver)
         time.sleep(0.8)
         du.expand_main_accordions(driver, max_clicks=12)
-        revealed = du.reveal_event_page_deep_links(driver, ev)
+        tickets, extract_counts = extract_ticket_urls_from_loaded_selenium_page(driver, event_url=ev)
         html, visible_text, current_url = _read_state()
-        merged = du.merge_link_candidates(html, driver, ev)
-        merged |= revealed
-
-        tickets: set[str] = set()
-        for u in merged:
-            nu = du.normalize_url(u)
-            if not nu or not du.is_ticket_url(nu):
-                continue
-            eu = du.normalize_url(du.event_url_from_ticket_url(nu) or "")
-            if eu == ev:
-                tickets.add(nu)
-
-        cache_tickets = du.extract_ticket_urls_from_eventtype_cache(html, base_url=ev)
-        for tu in cache_tickets:
-            nu = du.normalize_url(tu)
-            if nu and du.normalize_url(du.event_url_from_ticket_url(nu) or "") == ev:
-                tickets.add(nu)
-
-        snippets.append(
-            {
-                "merge_candidates_count": len(merged),
-                "eventtype_cache_count": len(cache_tickets),
-                "revealed_count": len(revealed),
-            }
-        )
+        snippets.append(extract_counts)
         _write_step2_artifacts(
             debug_dir=debug_dir,
             html=html,
@@ -595,6 +621,109 @@ def discover_ticket_urls_from_event_selenium(
         if tickets:
             return Step2Result(ev, "ok", False, "selenium", sorted(tickets), debug_dir=debug_dir)
         return Step2Result(ev, "no_data", False, "selenium", [], debug_dir=debug_dir)
+    finally:
+        with contextlib.suppress(Exception):
+            driver.quit()
+
+
+def discover_ticket_urls_from_event_selenium_embedded_only(
+    event_url: str,
+    *,
+    headed: bool,
+    debug: bool,
+    verification_wait_seconds: int = 45,
+    debug_root: str = "step2_vps_live",
+    wait_for_manual_verification: bool = False,
+    manual_verification_timeout: int = 300,
+) -> Step2Result:
+    """
+    Selenium lightweight strategy:
+    - open event page
+    - minimal wait
+    - parse embedded JSON/script caches only
+    - no scroll/accordion expansion
+    """
+    ev = du.normalize_url(event_url) or event_url
+    debug_dir = None
+    if debug:
+        root = _ensure_debug_dir(debug_root)
+        sub = root / _safe_key_from_event_url(ev)
+        sub.mkdir(parents=True, exist_ok=True)
+        debug_dir = str(sub.resolve())
+
+    driver = du.new_driver(headless=not headed)
+    try:
+        driver.set_page_load_timeout(max(45, int(verification_wait_seconds) + 15))
+        driver.get(ev)
+        time.sleep(1.0)
+        html = du.wait_for_page_content(driver, headless=not headed)
+        visible_text = ""
+        with contextlib.suppress(Exception):
+            visible_text = str(driver.execute_script("return document.body && document.body.innerText") or "")
+        current_url = str(getattr(driver, "current_url", "") or "")
+
+        verification = du.is_blocked_for_discovery(html) or du.looks_like_verification(html) or _is_verification_text(visible_text)
+        if verification:
+            time.sleep(max(0, int(verification_wait_seconds)))
+            html = driver.page_source or html
+            with contextlib.suppress(Exception):
+                visible_text = str(driver.execute_script("return document.body && document.body.innerText") or "")
+            current_url = str(getattr(driver, "current_url", "") or "")
+            verification = du.is_blocked_for_discovery(html) or du.looks_like_verification(html) or _is_verification_text(visible_text)
+            if verification and wait_for_manual_verification:
+                ok, html_wait = _wait_for_manual_verification_selenium(
+                    driver,
+                    timeout_seconds=int(manual_verification_timeout),
+                    poll_seconds=10,
+                )
+                html = html_wait or html
+                verification = not ok
+            if verification:
+                _write_step2_artifacts(
+                    debug_dir=debug_dir,
+                    html=html,
+                    visible_text=visible_text,
+                    current_url=current_url,
+                    browser_strategy="selenium_embedded_only_blocked",
+                    extracted_json_snippets=[],
+                    screenshot_writer=getattr(driver, "save_screenshot", None),
+                )
+                return Step2Result(ev, "blocked", True, "selenium_embedded_only", [], debug_dir=debug_dir)
+
+        if _looks_like_404(visible_text or html):
+            _write_step2_artifacts(
+                debug_dir=debug_dir,
+                html=html,
+                visible_text=visible_text,
+                current_url=current_url,
+                browser_strategy="selenium_embedded_only_404",
+                extracted_json_snippets=[],
+                screenshot_writer=getattr(driver, "save_screenshot", None),
+            )
+            return Step2Result(ev, "no_data", False, "selenium_embedded_only", [], debug_dir=debug_dir)
+
+        tickets: set[str] = set()
+        for tu in du.extract_ticket_urls_from_eventtype_cache(html, base_url=ev):
+            nu = du.normalize_url(tu)
+            if nu and du.normalize_url(du.event_url_from_ticket_url(nu) or "") == ev:
+                tickets.add(nu)
+        for tu in du.extract_next_data_link_candidates(html, base_url=ev):
+            nu = du.normalize_url(tu)
+            if nu and du.is_ticket_url(nu) and du.normalize_url(du.event_url_from_ticket_url(nu) or "") == ev:
+                tickets.add(nu)
+
+        _write_step2_artifacts(
+            debug_dir=debug_dir,
+            html=html,
+            visible_text=visible_text,
+            current_url=current_url,
+            browser_strategy="selenium_embedded_only",
+            extracted_json_snippets=[{"embedded_ticket_count": len(tickets)}],
+            screenshot_writer=getattr(driver, "save_screenshot", None),
+        )
+        if tickets:
+            return Step2Result(ev, "ok", False, "selenium_embedded_only", sorted(tickets), debug_dir=debug_dir)
+        return Step2Result(ev, "no_data", False, "selenium_embedded_only", [], debug_dir=debug_dir)
     finally:
         with contextlib.suppress(Exception):
             driver.quit()
