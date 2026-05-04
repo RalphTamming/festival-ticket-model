@@ -10,6 +10,7 @@ import contextlib
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -163,6 +164,32 @@ def require_display_for_headed_vps() -> None:
     """Linux: headed Chrome needs DISPLAY (e.g. Xvfb :99)."""
     if not sys.platform.startswith("linux"):
         return
+    # `xvfb-run` Xvfb commonly uses `-auth /tmp/xvfb-run.<id>/Xauthority`. If DISPLAY is set but
+    # XAUTHORITY is missing, Chrome often fails immediately with an X11 auth error / missing display.
+    if not str(os.environ.get("XAUTHORITY", "")).strip():
+        disp = str(os.environ.get("DISPLAY", "")).strip()
+        if disp:
+            disp_token = disp if disp.startswith(":") else f":{disp}"
+            disp_token = disp_token.split(".", 1)[0]  # :99.0 -> :99
+            try:
+                out = subprocess.check_output(["pgrep", "-a", "Xvfb"], text=True)
+            except Exception:
+                out = ""
+            auth: str = ""
+            for ln in (out or "").splitlines():
+                if disp_token not in ln:
+                    continue
+                m = re.search(r"(?:^|\s)-auth\s+(\S+)", ln)
+                if m:
+                    auth = str(m.group(1)).strip()
+                    break
+                # Fallback: `-auth<file>` (no whitespace)
+                m2 = re.search(r"-auth(\S+)", ln)
+                if m2:
+                    auth = str(m2.group(1)).strip()
+                    break
+            if auth and Path(auth).is_file():
+                os.environ["XAUTHORITY"] = auth
     disp = str(os.environ.get("DISPLAY", "")).strip()
     if not disp:
         raise SystemExit(
