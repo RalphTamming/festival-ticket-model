@@ -17,6 +17,10 @@ export TICKETSWAP_BROWSER_MODE=headed_vps
 export TICKETSWAP_HEADLESS=0
 export TICKETSWAP_PROFILE_DIR=/opt/ticketswap/profile
 export DISPLAY=:99   # or your VNC display
+# If Chrome fails with “Authorization required, but no authorization protocol specified”, you likely
+# launched Xvfb via `xvfb-run` which requires the matching cookie file:
+#   export XAUTHORITY=/tmp/xvfb-run.<...>/Xauthority
+# `bash scripts/smoke_step2_vps.sh` tries to auto-detect this for the active `:99` Xvfb on Linux.
 ```
 
 Behavior:
