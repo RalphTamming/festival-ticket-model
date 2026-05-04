@@ -18,16 +18,25 @@ Usage:
 
 from __future__ import annotations
 
+# Allow `python discovery/step2_discover_ticket_urls.py` from repo root (not only `python -m ...`).
+import sys
+from pathlib import Path as _Path_for_sys
+
+_repo_root = _Path_for_sys(__file__).resolve().parents[1]
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+
 import argparse
 import base64
 import contextlib
 import json
+import logging
 import re
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
@@ -35,10 +44,18 @@ from playwright.sync_api import sync_playwright
 import config
 import db as dbmod
 from discovery import discover_urls as du
+from discovery.ticketswap_relaxed_extract import extract_relaxed_festival_ticket_urls_from_html
 
+
+LOGGER = logging.getLogger("ticketswap.step2")
 
 TICKET_PATH_RE = re.compile(
-    r"(/(?:festival-tickets|concert-tickets|club-tickets|sports-tickets)/[^/]+/[^/]+/\d+)",
+    r"(/(?:festival-tickets|concert-tickets|club-tickets|sports-tickets)/[^/]+/[^/]+/\d{5,})",
+    re.IGNORECASE,
+)
+
+TICKETSWAP_TICKET_URL_RE = re.compile(
+    r"^https://www\.ticketswap\.com/festival-tickets/[^?#]+/[^/?#]+/\d+/?(?:[?#].*)?$",
     re.IGNORECASE,
 )
 
@@ -51,6 +68,10 @@ class Step2Result:
     strategy: str  # static | embedded_json | network | db_fallback | none
     ticket_urls: list[str]
     debug_dir: Optional[str] = None
+    # Single taxonomy label when status != ok (headed_vps / diagnostics).
+    failure_reason: Optional[str] = None
+    # Clearer outcome status used by VPS production tests / reporting.
+    result_status: Optional[str] = None
 
 
 def _ensure_debug_dir(debug_root: str = "step2") -> Path:
@@ -84,6 +105,32 @@ def _guess_hub_slug_from_event_url(event_url: str) -> str:
     # fallback: first 2 hyphen tokens (works for awakenings-upclose)
     parts = [p for p in slug.split("-") if p]
     return "-".join(parts[:2]) if len(parts) >= 2 else (parts[0] if parts else "")
+
+
+def _maybe_write_vps_failure_bundle(
+    *,
+    driver: Any,
+    event_url: str,
+    failure_reason: str,
+    headed: bool,
+) -> None:
+    if not getattr(config, "STEP2_DEBUG_DUMP_ON_FAILURE", False):
+        return
+    try:
+        from discovery import ticketswap_vps_mode as tvm
+
+        mode = (tvm.browser_mode_from_env() or "").strip() or ("headed" if headed else "headless")
+        health = str(getattr(config, "STEP2_LAST_PROFILE_HEALTH", "unknown") or "unknown")
+        tvm.write_vps_failure_debug(
+            slug=_safe_key_from_event_url(event_url),
+            driver=driver,
+            html=str(driver.page_source or ""),
+            browser_mode=mode,
+            profile_health=health,
+            failure_reason=failure_reason,
+        )
+    except Exception:
+        LOGGER.debug("vps failure debug bundle skipped", exc_info=True)
 
 
 def _write_step2_artifacts(
@@ -128,11 +175,89 @@ def _looks_like_404(text: str) -> bool:
     return "hmm, 404" in t or "we’re a bit lost" in t or "we're a bit lost" in t or "couldn’t find that page" in t or "couldn't find that page" in t
 
 
+def extract_ticket_urls_from_hydrated_dom_anchors(driver: Any) -> list[str]:
+    """
+    Robust fallback: scan hydrated DOM anchors for real ticket-row links.
+
+    Requirements:
+    - Do NOT rely on hashed CSS classes (unstable).
+    - Use URL regex + minimal semantic guards (icon/text).
+    """
+    urls: set[str] = set()
+    try:
+        anchors = driver.find_elements("css selector", "a[href]")
+    except Exception:
+        anchors = []
+    for a in anchors or []:
+        try:
+            href = (a.get_attribute("href") or "").strip()
+            if not href:
+                continue
+            if not TICKETSWAP_TICKET_URL_RE.match(href):
+                continue
+            has_ticket_icon = False
+            with contextlib.suppress(Exception):
+                has_ticket_icon = bool(a.find_elements("css selector", 'svg[aria-label="Ticket"]'))
+            text = ""
+            with contextlib.suppress(Exception):
+                text = (a.text or "").strip()
+            if not has_ticket_icon and not text:
+                continue
+            urls.add(href.rstrip("/"))
+        except Exception:
+            continue
+    return sorted(urls)
+
+
+def _normalize_current_url(driver: Any) -> str:
+    with contextlib.suppress(Exception):
+        return du.normalize_url(str(getattr(driver, "current_url", "") or "")) or ""
+    return ""
+
+
+def _wait_for_hub_canonical_or_timeout(
+    driver: Any,
+    *,
+    event_url: str,
+    max_wait_seconds: float,
+    poll_seconds: float = 2.0,
+) -> tuple[bool, str]:
+    """
+    Some hubs first land on a partial/legacy slug then redirect to canonical
+    `/festival-tickets/a/<hub>`. Wait (bounded) for that redirect.
+    """
+    end = time.time() + max(0.0, float(max_wait_seconds))
+    last = _normalize_current_url(driver) or (du.normalize_url(event_url) or event_url)
+    while time.time() <= end:
+        last = _normalize_current_url(driver) or last
+        if "/festival-tickets/a/" in (urlparse(last).path or "").lower():
+            return True, last
+        time.sleep(max(0.2, float(poll_seconds)))
+    return False, last
+
+
+def _wait_for_ticket_dom_anchors(
+    driver: Any,
+    *,
+    max_wait_seconds: float,
+    poll_seconds: float = 2.0,
+) -> list[str]:
+    end = time.time() + max(0.0, float(max_wait_seconds))
+    last: list[str] = []
+    while time.time() <= end:
+        last = extract_ticket_urls_from_hydrated_dom_anchors(driver)
+        if last:
+            return last
+        time.sleep(max(0.2, float(poll_seconds)))
+    return last
+
+
 def classify_loaded_selenium_page(
     *,
     current_url: str,
     html: str,
     visible_text: str,
+    title: str = "",
 ) -> str:
     """Classify what kind of page Selenium ended up on.
 
@@ -161,7 +286,12 @@ def classify_loaded_selenium_page(
 
     if "/401" in cur:
         return "401_or_forbidden"
-    if du.is_blocked_for_discovery(html) or du.looks_like_verification(html):
+    if du.is_blocked_for_discovery(
+        html,
+        title=title,
+        visible_text=visible_text,
+        current_url=current_url,
+    ) or du.looks_like_verification(html):
         return "verification_page"
     if _is_verification_text(visible_text) and len(visible_text or "") < 400:
         return "verification_page"
@@ -180,8 +310,45 @@ def extract_ticket_urls_from_loaded_selenium_page(
     driver: Any,
     *,
     event_url: str,
+    headless_for_hub_wait: bool = True,
 ) -> tuple[list[str], dict[str, int]]:
     ev = du.normalize_url(event_url) or event_url
+    if du.is_festival_page(ev):
+        hub_stats: dict[str, Any] = {}
+        hub_tickets = du.collect_festival_hub_ticket_urls(
+            driver,
+            ev,
+            out_stats=hub_stats,
+            headless_for_wait=bool(headless_for_hub_wait),
+        )
+        counts = {
+            "merge_candidates_count": 0,
+            "eventtype_cache_count": 0,
+            "revealed_count": 0,
+            "hub_mode": 1,
+            "hub_ticket_count": len(hub_tickets),
+            "subpages_checked": int(hub_stats.get("subpages_checked", 0)),
+            "dated_event_count": int(hub_stats.get("dated_event_count", 0)),
+            "direct_hub_ticket_count": int(hub_stats.get("direct_hub_ticket_count", 0)),
+        }
+        return sorted(hub_tickets), counts
+    early: set[str] = set()
+    if getattr(config, "STEP2_INTERACT_ENABLED", False):
+        n_rounds = int(getattr(config, "STEP2_INTERACT_ROUNDS", 3))
+        for _ in range(max(0, n_rounds)):
+            du.step2_interact_once(driver)
+            time.sleep(float(getattr(config, "STEP2_INTERACTION_WAIT_SECONDS", 2.5)))
+            du.scroll_for_lazy_content(driver)
+            du.expand_main_accordions(driver, max_clicks=12)
+            h_i = driver.page_source or ""
+            for u in du.merge_link_candidates(h_i, driver, ev):
+                nu = du.normalize_url(u)
+                if nu and du.is_ticket_url(nu) and du.normalize_url(du.event_url_from_ticket_url(nu) or "") == ev:
+                    early.add(nu)
+            for tu in du.extract_ticket_urls_from_eventtype_cache(h_i, base_url=ev):
+                nu = du.normalize_url(tu)
+                if nu and du.normalize_url(du.event_url_from_ticket_url(nu) or "") == ev:
+                    early.add(nu)
     revealed = du.reveal_event_page_deep_links(driver, ev)
     html = driver.page_source or ""
     merged = du.merge_link_candidates(html, driver, ev)
@@ -199,6 +366,7 @@ def extract_ticket_urls_from_loaded_selenium_page(
         nu = du.normalize_url(tu)
         if nu and du.normalize_url(du.event_url_from_ticket_url(nu) or "") == ev:
             tickets.add(nu)
+    tickets |= early
     counts = {
         "merge_candidates_count": len(merged),
         "eventtype_cache_count": len(cache_tickets),
@@ -217,7 +385,21 @@ def _wait_for_manual_verification_selenium(
     last_html = ""
     while time.time() <= end:
         last_html = driver.page_source or ""
-        if not du.is_blocked_for_discovery(last_html) and not du.looks_like_verification(last_html):
+        vis = ""
+        with contextlib.suppress(Exception):
+            vis = str(driver.execute_script("return document.body && document.body.innerText") or "")
+        title = ""
+        with contextlib.suppress(Exception):
+            title = str(getattr(driver, "title", "") or "")
+        cur = ""
+        with contextlib.suppress(Exception):
+            cur = str(getattr(driver, "current_url", "") or "")
+        if not du.is_blocked_for_discovery(
+            last_html,
+            title=title,
+            visible_text=vis[:8000],
+            current_url=cur,
+        ) and not du.looks_like_verification(last_html):
             return True, last_html
         time.sleep(max(1, int(poll_seconds)))
     return False, last_html
@@ -448,7 +630,11 @@ def discover_ticket_urls_from_event_playwright(
                 return Step2Result(ev, "no_data", bool(verification), "none", [], debug_dir=debug_dir)
 
             # Static/embedded JSON from HTML
-            static_candidates = du.extract_ticket_urls_from_page_text(html, base_url=ev) | du.extract_ticket_urls_from_eventtype_cache(html, base_url=ev)
+            static_candidates = (
+                du.extract_ticket_urls_from_page_text(html, base_url=ev)
+                | du.extract_ticket_urls_from_eventtype_cache(html, base_url=ev)
+                | extract_relaxed_festival_ticket_urls_from_html(html, base_url=ev)
+            )
             static_ticket_urls = sorted({u for u in static_candidates if du.is_ticket_url(u)})
             if static_ticket_urls:
                 if debug and debug_dir:
@@ -564,6 +750,9 @@ def discover_ticket_urls_from_event_selenium(
     debug_root: str = "step2_vps_live",
     wait_for_manual_verification: bool = False,
     manual_verification_timeout: int = 300,
+    manual_verification_press_enter: bool = False,
+    debug_dump: bool = False,
+    existing_driver: Any | None = None,
 ) -> Step2Result:
     ev = du.normalize_url(event_url) or event_url
     debug_dir = None
@@ -573,14 +762,16 @@ def discover_ticket_urls_from_event_selenium(
         sub.mkdir(parents=True, exist_ok=True)
         debug_dir = str(sub.resolve())
 
-    driver = du.new_driver(headless=not headed)
+    own_driver = existing_driver is None
+    driver = existing_driver if existing_driver is not None else du.new_driver(headless=not headed)
     try:
         html = ""
         visible_text = ""
         current_url = ev
+        page_title = ""
         snippets: list[dict[str, Any]] = []
 
-        def _read_state() -> tuple[str, str, str]:
+        def _read_state() -> tuple[str, str, str, str]:
             h = driver.page_source or ""
             t = ""
             with contextlib.suppress(Exception):
@@ -588,28 +779,42 @@ def discover_ticket_urls_from_event_selenium(
             c = ""
             with contextlib.suppress(Exception):
                 c = str(getattr(driver, "current_url", "") or "")
-            return h, t, c
+            ti = ""
+            with contextlib.suppress(Exception):
+                ti = str(getattr(driver, "title", "") or "")
+            return h, t, c, ti
+
+        def _blocked(h: str, vis: str, cur: str, title: str) -> bool:
+            return bool(
+                du.is_blocked_for_discovery(
+                    h,
+                    title=title,
+                    visible_text=vis[:8000],
+                    current_url=cur,
+                )
+                or du.looks_like_verification(h)
+                or _is_verification_text(vis)
+            )
 
         driver.set_page_load_timeout(max(60, verification_wait_seconds + 30))
         driver.get(ev)
         time.sleep(1.5)
         html = du.wait_for_page_content(driver, headless=not headed)
-        html, visible_text, current_url = _read_state()
-        verification = du.is_blocked_for_discovery(html) or du.looks_like_verification(html) or _is_verification_text(visible_text)
+        html, visible_text, current_url, page_title = _read_state()
+        verification = _blocked(html, visible_text, current_url, page_title)
 
-        # Stronger wait-before-block: wait -> reload -> wait.
         if verification:
             time.sleep(max(0, int(verification_wait_seconds)))
             with contextlib.suppress(Exception):
                 driver.get(ev)
             time.sleep(1.0)
             html = du.wait_for_page_content(driver, headless=not headed)
-            html, visible_text, current_url = _read_state()
-            verification = du.is_blocked_for_discovery(html) or du.looks_like_verification(html) or _is_verification_text(visible_text)
+            html, visible_text, current_url, page_title = _read_state()
+            verification = _blocked(html, visible_text, current_url, page_title)
             if verification:
                 time.sleep(max(0, int(verification_wait_seconds)))
-                html, visible_text, current_url = _read_state()
-                verification = du.is_blocked_for_discovery(html) or du.looks_like_verification(html) or _is_verification_text(visible_text)
+                html, visible_text, current_url, page_title = _read_state()
+                verification = _blocked(html, visible_text, current_url, page_title)
             if verification and wait_for_manual_verification:
                 ok, html_wait = _wait_for_manual_verification_selenium(
                     driver,
@@ -617,9 +822,17 @@ def discover_ticket_urls_from_event_selenium(
                     poll_seconds=10,
                 )
                 html = html_wait or html
-                html, visible_text, current_url = _read_state()
-                verification = not ok
+                html, visible_text, current_url, page_title = _read_state()
+                verification = _blocked(html, visible_text, current_url, page_title) if not ok else False
+            if verification and headed and manual_verification_press_enter:
+                du.pause_manual_verification_enter(logger=LOGGER)
+                with contextlib.suppress(Exception):
+                    driver.get(ev)
+                html = du.wait_for_page_content(driver, headless=not headed)
+                html, visible_text, current_url, page_title = _read_state()
+                verification = _blocked(html, visible_text, current_url, page_title)
             if verification:
+                du.log_step2_verification_blocked(LOGGER, url=ev)
                 _write_step2_artifacts(
                     debug_dir=debug_dir,
                     html=html,
@@ -629,14 +842,28 @@ def discover_ticket_urls_from_event_selenium(
                     extracted_json_snippets=snippets,
                     screenshot_writer=getattr(driver, "save_screenshot", None),
                 )
-                return Step2Result(ev, "blocked", True, "selenium", [], debug_dir=debug_dir)
+                cur_l = (current_url or "").lower()
+                fr = "login_required" if "/login" in cur_l else "verification_blocked"
+                _maybe_write_vps_failure_bundle(driver=driver, event_url=ev, failure_reason=fr, headed=headed)
+                rs = "login_required" if fr == "login_required" else "verification_blocked"
+                return Step2Result(
+                    ev,
+                    "blocked",
+                    True,
+                    "selenium",
+                    [],
+                    debug_dir=debug_dir,
+                    failure_reason=fr,
+                    result_status=rs,
+                )
 
-        # Human-like behavior: scroll/hydrate then parse.
         du.scroll_for_lazy_content(driver)
         time.sleep(0.8)
         du.expand_main_accordions(driver, max_clicks=12)
-        tickets, extract_counts = extract_ticket_urls_from_loaded_selenium_page(driver, event_url=ev)
-        html, visible_text, current_url = _read_state()
+        tickets, extract_counts = extract_ticket_urls_from_loaded_selenium_page(
+            driver, event_url=ev, headless_for_hub_wait=not headed
+        )
+        html, visible_text, current_url, page_title = _read_state()
         snippets.append(extract_counts)
         _write_step2_artifacts(
             debug_dir=debug_dir,
@@ -647,12 +874,80 @@ def discover_ticket_urls_from_event_selenium(
             extracted_json_snippets=snippets,
             screenshot_writer=getattr(driver, "save_screenshot", None),
         )
+        prof = (
+            getattr(config, "STEP2_DRIVER_USER_DATA_DIR", None)
+            or config.persistent_browser_user_data_dir()
+            or ("anonymous" if getattr(config, "STEP2_USE_ANONYMOUS_PROFILE", False) else "none")
+        )
+        if debug_dump:
+            ver_yes = _blocked(html, visible_text, current_url, page_title)
+            hub_d = int(extract_counts.get("direct_hub_ticket_count", 0) or extract_counts.get("hub_ticket_count", 0) or 0)
+            dated_n = int(extract_counts.get("dated_event_count", 0))
+            sub_n = int(extract_counts.get("subpages_checked", 0))
+            print(
+                f"URL={ev}\tverification={'yes' if ver_yes else 'no'}\tbrowser_mode="
+                f"{'headed' if headed else 'headless'}\tprofile_dir={prof}\tinteract="
+                f"{bool(getattr(config, 'STEP2_INTERACT_ENABLED', False))}\tslow="
+                f"{bool(getattr(config, 'STEP2_SLOW_MODE', False))}\tdirect_tickets={hub_d}\t"
+                f"dated_events={dated_n}\tsubpages_checked={sub_n}\tfinal_fresh_tickets={len(tickets)}",
+                flush=True,
+            )
         if tickets:
-            return Step2Result(ev, "ok", False, "selenium", sorted(tickets), debug_dir=debug_dir)
-        return Step2Result(ev, "no_data", False, "selenium", [], debug_dir=debug_dir)
+            return Step2Result(
+                ev,
+                "ok",
+                False,
+                "selenium",
+                sorted(tickets),
+                debug_dir=debug_dir,
+                failure_reason=None,
+                result_status="success_fresh_urls_found",
+            )
+
+        # Bounded hydration/redirect wait + DOM-anchor fallback.
+        hydration_budget = float(getattr(config, "STEP2_HYDRATION_MAX_SECONDS", 90.0))
+        poll = float(getattr(config, "STEP2_HYDRATION_POLL_SECONDS", 2.0))
+        nav_ok = True
+        if du.is_festival_page(ev):
+            nav_ok, _cur = _wait_for_hub_canonical_or_timeout(
+                driver,
+                event_url=ev,
+                max_wait_seconds=min(hydration_budget, 45.0),
+                poll_seconds=poll,
+            )
+            hydration_left = max(0.0, hydration_budget - min(hydration_budget, 45.0))
+        else:
+            hydration_left = hydration_budget
+
+        anchor_urls = _wait_for_ticket_dom_anchors(driver, max_wait_seconds=hydration_left, poll_seconds=poll)
+        if anchor_urls:
+            return Step2Result(
+                ev,
+                "ok",
+                False,
+                "selenium_dom_anchor_fallback",
+                anchor_urls,
+                debug_dir=debug_dir,
+                failure_reason=None,
+                result_status="success_fresh_urls_found",
+            )
+
+        fr = "navigation_or_redirect_failed" if (du.is_festival_page(ev) and not nav_ok) else "no_fresh_urls_after_hydration"
+        _maybe_write_vps_failure_bundle(driver=driver, event_url=ev, failure_reason=fr, headed=headed)
+        return Step2Result(
+            ev,
+            "no_data",
+            False,
+            "selenium",
+            [],
+            debug_dir=debug_dir,
+            failure_reason=fr,
+            result_status=fr if fr != "no_fresh_urls_after_hydration" else "no_fresh_urls_after_hydration",
+        )
     finally:
-        with contextlib.suppress(Exception):
-            driver.quit()
+        if own_driver:
+            with contextlib.suppress(Exception):
+                driver.quit()
 
 
 def discover_ticket_urls_from_event_selenium_embedded_only(
@@ -664,6 +959,7 @@ def discover_ticket_urls_from_event_selenium_embedded_only(
     debug_root: str = "step2_vps_live",
     wait_for_manual_verification: bool = False,
     manual_verification_timeout: int = 300,
+    manual_verification_press_enter: bool = False,
 ) -> Step2Result:
     """
     Selenium lightweight strategy:
@@ -690,15 +986,27 @@ def discover_ticket_urls_from_event_selenium_embedded_only(
         with contextlib.suppress(Exception):
             visible_text = str(driver.execute_script("return document.body && document.body.innerText") or "")
         current_url = str(getattr(driver, "current_url", "") or "")
+        page_title = ""
+        with contextlib.suppress(Exception):
+            page_title = str(getattr(driver, "title", "") or "")
 
-        verification = du.is_blocked_for_discovery(html) or du.looks_like_verification(html) or _is_verification_text(visible_text)
+        def _blk(h: str, vis: str, cur: str, ti: str) -> bool:
+            return bool(
+                du.is_blocked_for_discovery(h, title=ti, visible_text=vis[:8000], current_url=cur)
+                or du.looks_like_verification(h)
+                or _is_verification_text(vis)
+            )
+
+        verification = _blk(html, visible_text, current_url, page_title)
         if verification:
             time.sleep(max(0, int(verification_wait_seconds)))
             html = driver.page_source or html
             with contextlib.suppress(Exception):
                 visible_text = str(driver.execute_script("return document.body && document.body.innerText") or "")
             current_url = str(getattr(driver, "current_url", "") or "")
-            verification = du.is_blocked_for_discovery(html) or du.looks_like_verification(html) or _is_verification_text(visible_text)
+            with contextlib.suppress(Exception):
+                page_title = str(getattr(driver, "title", "") or "")
+            verification = _blk(html, visible_text, current_url, page_title)
             if verification and wait_for_manual_verification:
                 ok, html_wait = _wait_for_manual_verification_selenium(
                     driver,
@@ -706,8 +1014,25 @@ def discover_ticket_urls_from_event_selenium_embedded_only(
                     poll_seconds=10,
                 )
                 html = html_wait or html
-                verification = not ok
+                with contextlib.suppress(Exception):
+                    visible_text = str(driver.execute_script("return document.body && document.body.innerText") or "")
+                current_url = str(getattr(driver, "current_url", "") or "")
+                with contextlib.suppress(Exception):
+                    page_title = str(getattr(driver, "title", "") or "")
+                verification = _blk(html, visible_text, current_url, page_title) if not ok else False
+            if verification and headed and manual_verification_press_enter:
+                du.pause_manual_verification_enter(logger=LOGGER)
+                with contextlib.suppress(Exception):
+                    driver.get(ev)
+                html = du.wait_for_page_content(driver, headless=not headed)
+                with contextlib.suppress(Exception):
+                    visible_text = str(driver.execute_script("return document.body && document.body.innerText") or "")
+                current_url = str(getattr(driver, "current_url", "") or "")
+                with contextlib.suppress(Exception):
+                    page_title = str(getattr(driver, "title", "") or "")
+                verification = _blk(html, visible_text, current_url, page_title)
             if verification:
+                du.log_step2_verification_blocked(LOGGER, url=ev)
                 _write_step2_artifacts(
                     debug_dir=debug_dir,
                     html=html,
@@ -717,7 +1042,9 @@ def discover_ticket_urls_from_event_selenium_embedded_only(
                     extracted_json_snippets=[],
                     screenshot_writer=getattr(driver, "save_screenshot", None),
                 )
-                return Step2Result(ev, "blocked", True, "selenium_embedded_only", [], debug_dir=debug_dir)
+                return Step2Result(
+                    ev, "blocked", True, "selenium_embedded_only", [], debug_dir=debug_dir, failure_reason="verification_blocked"
+                )
 
         if _looks_like_404(visible_text or html):
             _write_step2_artifacts(
@@ -762,46 +1089,118 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="STEP 2: discover deep TicketSwap ticket URLs from an event page.")
     p.add_argument("--event-url", required=True)
     p.add_argument("--browser", choices=["playwright", "selenium"], default="playwright")
-    p.add_argument("--headed", action="store_true", default=False, help="Run non-headless (recommended if verification appears).")
+    p.add_argument(
+        "--headed",
+        action="store_true",
+        default=False,
+        help="Explicit headed mode (default is already headed unless --headless or TICKETSWAP_HEADLESS=1).",
+    )
+    p.add_argument("--headless", action="store_true", default=False, help="Run headless (overrides default headed).")
     p.add_argument("--debug", action="store_true", default=False, help="Write debug artifacts to debug/step2/")
     p.add_argument("--db-fallback", action="store_true", default=True, help="Allow fallback to ticketswap.db if URLs exist.")
     p.add_argument("--verification-wait", type=int, default=60, help="Seconds to wait before retrying verification pages.")
-    p.add_argument("--wait-for-manual-verification", action="store_true", default=False)
+    p.add_argument(
+        "--wait-for-manual-verification",
+        action="store_true",
+        default=False,
+        help="Poll up to 300s for manual verification recovery (non-blocking stdin).",
+    )
+    p.add_argument(
+        "--manual-verification",
+        action="store_true",
+        default=False,
+        help="When verification is detected in headed mode, wait for Enter after you finish in the browser.",
+    )
+    p.add_argument("--profile-dir", type=str, default="", help="Chrome user-data-dir (overrides TICKETSWAP_PROFILE_DIR).")
+    p.add_argument(
+        "--anonymous-profile",
+        action="store_true",
+        default=False,
+        help="Ephemeral Chrome profile (no persisted TicketSwap session).",
+    )
+    p.add_argument("--slow", action="store_true", default=False, help="Longer page-ready and post-load waits.")
+    p.add_argument("--interact", action="store_true", default=False, help="Enable scroll/load-more interaction rounds.")
+    p.add_argument("--no-interact", action="store_true", default=False, help="Disable interaction even when headed.")
+    p.add_argument(
+        "--debug-dump",
+        action="store_true",
+        default=False,
+        help="Print per-URL STEP2 diagnostics (URL, verification, profile, counts).",
+    )
     return p.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    if args.browser == "selenium":
-        res = discover_ticket_urls_from_event_selenium(
-            args.event_url,
-            headed=bool(args.headed),
-            debug=bool(args.debug),
-            verification_wait_seconds=int(args.verification_wait),
-            debug_root="step2_vps_live",
-            wait_for_manual_verification=bool(args.wait_for_manual_verification),
-            manual_verification_timeout=300,
-        )
+    headed = bool(du.resolve_discovery_headed(args))
+    args.headed = headed
+    headless = not headed
+    if args.slow:
+        du.apply_step2_slow_timings()
+    config.STEP2_USE_ANONYMOUS_PROFILE = bool(args.anonymous_profile)
+    config.STEP2_DRIVER_USER_DATA_DIR = (
+        str(Path(args.profile_dir.strip()).resolve()) if str(getattr(args, "profile_dir", "") or "").strip() else None
+    )
+    if args.no_interact:
+        config.STEP2_INTERACT_ENABLED = False
+    elif args.interact:
+        config.STEP2_INTERACT_ENABLED = True
     else:
-        res = discover_ticket_urls_from_event_playwright(
-            args.event_url,
-            headed=bool(args.headed),
-            debug=bool(args.debug),
-            db_fallback=bool(args.db_fallback),
-            debug_root="step2_vps_live",
-            wait_for_manual_verification=bool(args.wait_for_manual_verification),
-            manual_verification_timeout=300,
-        )
-    print(f"event_url: {res.event_url}")
-    print(f"status: {res.status}")
-    print(f"verification_detected: {res.verification}")
-    print(f"strategy: {res.strategy}")
-    print(f"ticket_urls_found: {len(res.ticket_urls)}")
-    if res.debug_dir:
-        print(f"debug_dir: {res.debug_dir}")
-    for u in res.ticket_urls:
-        print(u)
-    return 0 if res.status == "ok" and res.ticket_urls else (2 if res.status == "blocked" else 1)
+        config.STEP2_INTERACT_ENABLED = bool(headed)
+    config.STEP2_MANUAL_VERIFICATION_PRESS_ENTER = bool(getattr(args, "manual_verification", False))
+    config.warn_if_step2_profile_missing(LOGGER)
+    if headless:
+        config.warn_step2_headless_without_trusted_profile(LOGGER)
+    prof = config.STEP2_DRIVER_USER_DATA_DIR or config.persistent_browser_user_data_dir() or (
+        "anonymous" if config.STEP2_USE_ANONYMOUS_PROFILE else "none"
+    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.info(
+        "BROWSER_MODE headed=%s profile_dir=%s interact=%s slow=%s",
+        str(bool(headed)).lower(),
+        prof,
+        str(bool(config.STEP2_INTERACT_ENABLED)).lower(),
+        str(bool(getattr(config, "STEP2_SLOW_MODE", False))).lower(),
+    )
+    try:
+        if args.browser == "selenium":
+            res = discover_ticket_urls_from_event_selenium(
+                args.event_url,
+                headed=bool(headed),
+                debug=bool(args.debug),
+                verification_wait_seconds=int(args.verification_wait),
+                debug_root="step2_vps_live",
+                wait_for_manual_verification=bool(args.wait_for_manual_verification),
+                manual_verification_timeout=300,
+                manual_verification_press_enter=bool(args.manual_verification),
+                debug_dump=bool(args.debug_dump),
+            )
+        else:
+            res = discover_ticket_urls_from_event_playwright(
+                args.event_url,
+                headed=bool(headed),
+                debug=bool(args.debug),
+                db_fallback=bool(args.db_fallback),
+                debug_root="step2_vps_live",
+                wait_for_manual_verification=bool(args.wait_for_manual_verification),
+                manual_verification_timeout=300,
+            )
+        print(f"event_url: {res.event_url}")
+        print(f"status: {res.status}")
+        print(f"verification_detected: {res.verification}")
+        print(f"strategy: {res.strategy}")
+        print(f"ticket_urls_found: {len(res.ticket_urls)}")
+        if res.debug_dir:
+            print(f"debug_dir: {res.debug_dir}")
+        for u in res.ticket_urls:
+            print(u)
+        return 0 if res.status == "ok" and res.ticket_urls else (2 if res.status == "blocked" else 1)
+    finally:
+        du.restore_step2_slow_timings()
+        config.STEP2_USE_ANONYMOUS_PROFILE = False
+        config.STEP2_DRIVER_USER_DATA_DIR = None
+        config.STEP2_INTERACT_ENABLED = False
+        config.STEP2_MANUAL_VERIFICATION_PRESS_ENTER = False
 
 
 if __name__ == "__main__":

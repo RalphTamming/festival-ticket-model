@@ -489,9 +489,22 @@ def _discover_shared_listing_click(
             with contextlib.suppress(Exception):
                 visible = str(driver.execute_script("return document.body && document.body.innerText") or "")
             current_url = str(getattr(driver, "current_url", "") or ev)
-            classification = classify_loaded_selenium_page(current_url=current_url, html=html, visible_text=visible)
+            page_title = ""
+            with contextlib.suppress(Exception):
+                page_title = str(getattr(driver, "title", "") or "")
+            classification = classify_loaded_selenium_page(
+                current_url=current_url, html=html, visible_text=visible, title=page_title
+            )
             if classification in ("401_or_forbidden", "verification_page"):
-                step2 = Step2Result(du.normalize_url(ev) or ev, "blocked", True, "shared_listing_click", [], debug_dir=None)
+                step2 = Step2Result(
+                    du.normalize_url(ev) or ev,
+                    "blocked",
+                    True,
+                    "shared_listing_click",
+                    [],
+                    debug_dir=None,
+                    failure_reason="verification_blocked",
+                )
                 blocked_streak += 1
                 if debug:
                     dbg = _save_shared_step2_debug(
@@ -505,9 +518,25 @@ def _discover_shared_listing_click(
                         counts={},
                         screenshot_writer=getattr(driver, "save_screenshot", None),
                     )
-                    step2 = Step2Result(step2.event_url, step2.status, step2.verification, step2.strategy, step2.ticket_urls, debug_dir=dbg)
+                    step2 = Step2Result(
+                        step2.event_url,
+                        step2.status,
+                        step2.verification,
+                        step2.strategy,
+                        step2.ticket_urls,
+                        debug_dir=dbg,
+                        failure_reason=step2.failure_reason,
+                    )
             elif classification == "404":
-                step2 = Step2Result(du.normalize_url(ev) or ev, "no_data", False, "shared_listing_click", [], debug_dir=None)
+                step2 = Step2Result(
+                    du.normalize_url(ev) or ev,
+                    "no_data",
+                    False,
+                    "shared_listing_click",
+                    [],
+                    debug_dir=None,
+                    failure_reason="no_ticket_urls_after_real_page",
+                )
                 blocked_streak = 0
                 if debug:
                     dbg = _save_shared_step2_debug(
@@ -521,11 +550,22 @@ def _discover_shared_listing_click(
                         counts={},
                         screenshot_writer=getattr(driver, "save_screenshot", None),
                     )
-                    step2 = Step2Result(step2.event_url, step2.status, step2.verification, step2.strategy, step2.ticket_urls, debug_dir=dbg)
+                    step2 = Step2Result(
+                        step2.event_url,
+                        step2.status,
+                        step2.verification,
+                        step2.strategy,
+                        step2.ticket_urls,
+                        debug_dir=dbg,
+                        failure_reason=step2.failure_reason,
+                    )
             else:
                 ticket_urls, counts = extract_ticket_urls_from_loaded_selenium_page(driver, event_url=ev)
                 status = "ok" if ticket_urls else "no_data"
-                step2 = Step2Result(du.normalize_url(ev) or ev, status, False, "shared_listing_click", ticket_urls, debug_dir=None)
+                fr = None if status == "ok" else "no_ticket_urls_after_real_page"
+                step2 = Step2Result(
+                    du.normalize_url(ev) or ev, status, False, "shared_listing_click", ticket_urls, debug_dir=None, failure_reason=fr
+                )
                 blocked_streak = 0
                 if debug and status != "ok":
                     dbg = _save_shared_step2_debug(
@@ -539,7 +579,15 @@ def _discover_shared_listing_click(
                         counts=counts,
                         screenshot_writer=getattr(driver, "save_screenshot", None),
                     )
-                    step2 = Step2Result(step2.event_url, step2.status, step2.verification, step2.strategy, step2.ticket_urls, debug_dir=dbg)
+                    step2 = Step2Result(
+                        step2.event_url,
+                        step2.status,
+                        step2.verification,
+                        step2.strategy,
+                        step2.ticket_urls,
+                        debug_dir=dbg,
+                        failure_reason=step2.failure_reason,
+                    )
             results.append((ev, step2))
             if blocked_streak >= int(max_consecutive_blocked):
                 break
@@ -565,6 +613,8 @@ def _discover_live_with_retry(
     verification_wait_seconds: int,
     wait_for_manual_verification: bool,
     manual_verification_timeout: int,
+    manual_verification_press_enter: bool = False,
+    debug_dump: bool = False,
     retries: int,
     strategy: str,
     blocked_sleep_min: int,
@@ -572,6 +622,7 @@ def _discover_live_with_retry(
     page_timeout_ms: int,
     pre_network_wait_ms: int,
     post_network_wait_ms: int,
+    existing_driver: Any | None = None,
 ) -> tuple[Step2Result, int, Optional[str], bool]:
     last: Optional[Step2Result] = None
     err_detail: Optional[str] = None
@@ -616,6 +667,7 @@ def _discover_live_with_retry(
                         debug_root="step2_vps_live",
                         wait_for_manual_verification=bool(wait_for_manual_verification),
                         manual_verification_timeout=int(manual_verification_timeout),
+                        manual_verification_press_enter=bool(manual_verification_press_enter),
                     )
                 elif strategy == "selenium":
                     cand = discover_ticket_urls_from_event_selenium(
@@ -626,6 +678,9 @@ def _discover_live_with_retry(
                         debug_root="step2_vps_live",
                         wait_for_manual_verification=bool(wait_for_manual_verification),
                         manual_verification_timeout=int(manual_verification_timeout),
+                        manual_verification_press_enter=bool(manual_verification_press_enter),
+                        debug_dump=bool(debug_dump),
+                        existing_driver=existing_driver,
                     )
                 else:
                     cand = discover_ticket_urls_from_event_playwright(
@@ -655,7 +710,13 @@ def _discover_live_with_retry(
             if attempt < total_attempts - 1:
                 continue
             ev = du.normalize_url(event_url) or event_url
-            return Step2Result(ev, "error", False, "none", [], debug_dir=None), attempt + 1, err_detail, verification_detected
+            fr = "timeout" if "timeout" in str(e).lower() or "timeout" in type(e).__name__.lower() else "extraction_error"
+            return (
+                Step2Result(ev, "error", False, "none", [], debug_dir=None, failure_reason=fr),
+                attempt + 1,
+                err_detail,
+                verification_detected,
+            )
         last = res
         if res.status == "ok" and res.ticket_urls:
             return res, attempt + 1, None, verification_detected
@@ -850,12 +911,108 @@ def _export_mode_csvs(conn: Any, output_dir: Path) -> dict[str, Path]:
 
 
 def run_discovery_mode(args: Any) -> int:
+    from discovery import ticketswap_vps_mode as tvm
+
     logging.info("Starting discovery mode")
     scope_name = str(args.scope)
-    listing_urls = [str(args.listing_url)] if args.listing_url else list(config.SCOPES.get(scope_name, {}).get("listing_urls", []))
-    if not listing_urls:
-        raise SystemExit(f"No listing URLs configured for scope '{scope_name}'.")
+    pd = str(getattr(args, "profile_dir", "") or "").strip()
+    if pd:
+        os.environ["TICKETSWAP_PROFILE_DIR"] = str(Path(pd).expanduser().resolve())
+
+    use_vps_eighteen = bool(getattr(args, "vps_eighteen_hubs", False)) or str(
+        os.getenv("TICKETSWAP_VPS_EIGHTEEN", "")
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+    hub_event_urls: list[str] = []
+    if use_vps_eighteen:
+        from discovery.vps_eighteen_targets import EIGHTEEN_FESTIVAL_URLS
+
+        hub_event_urls = list(EIGHTEEN_FESTIVAL_URLS)
+        listing_urls: list[str] = []
+    else:
+        listing_urls = [str(args.listing_url)] if args.listing_url else list(
+            config.SCOPES.get(scope_name, {}).get("listing_urls", [])
+        )
+        if not listing_urls:
+            raise SystemExit(f"No listing URLs configured for scope '{scope_name}'.")
+
+    headed_vps = tvm.is_headed_vps_browser_mode(args)
+    if headed_vps and bool(getattr(args, "headless", False)):
+        raise SystemExit(
+            "headed_vps (TICKETSWAP_BROWSER_MODE=headed_vps or --headed-vps) cannot be combined with --headless."
+        )
+
+    args.headed = bool(du.resolve_discovery_headed(args))
     headless = not bool(args.headed)
+
+    if use_vps_eighteen and headless:
+        raise SystemExit("--vps-eighteen-hubs (or TICKETSWAP_VPS_EIGHTEEN=1) requires headed Chrome (not --headless).")
+
+    if bool(getattr(args, "anonymous_profile", False)):
+        config.STEP2_USE_ANONYMOUS_PROFILE = True
+    if bool(getattr(args, "no_interact", False)):
+        config.STEP2_INTERACT_ENABLED = False
+    elif bool(getattr(args, "interact", False)):
+        config.STEP2_INTERACT_ENABLED = True
+    if bool(getattr(args, "manual_verification", False)):
+        config.STEP2_MANUAL_VERIFICATION_PRESS_ENTER = True
+    if bool(getattr(args, "debug_dump", False)):
+        setattr(config, "STEP2_DEBUG_DUMP_ON_FAILURE", True)
+
+    setattr(config, "STEP2_LAST_PROFILE_HEALTH", "unknown")
+    vps_lock_acquired = False
+    if headed_vps:
+        tvm.validate_headed_vps_prerequisites(profile_dir=config.ticketswap_profile_directory(), allow_anonymous=False)
+        tvm.apply_headed_vps_runtime_defaults()
+        try:
+            tvm.acquire_step2_profile_lock(
+                config.ticketswap_profile_directory(),
+                logger=logging.getLogger("ticketswap.pipeline"),
+            )
+            vps_lock_acquired = True
+        except tvm.ProfileLockError as exc:
+            logging.error("%s", exc)
+            print(str(exc), flush=True)
+            return 4
+        hr = tvm.run_profile_health_probe(headed=True, logger=logging.getLogger("ticketswap.pipeline"))
+        setattr(config, "STEP2_LAST_PROFILE_HEALTH", hr.status.value)
+        if hr.status != tvm.ProfileHealthStatus.trusted:
+            if tvm.is_non_interactive_vps():
+                tvm.release_step2_profile_lock()
+                vps_lock_acquired = False
+                raise SystemExit(
+                    f"PROFILE_HEALTH status={hr.status.value} — non-interactive environment cannot clear "
+                    "verification/login. Fix the profile using a display/VNC (see scripts/README_step2_vps.md)."
+                )
+            logging.warning(
+                "PROFILE_HEALTH status=%s; solve verification/login in the browser, then press Enter.",
+                hr.status.value,
+            )
+            du.pause_manual_verification_enter(logger=logging.getLogger("ticketswap.pipeline"))
+            hr = tvm.run_profile_health_probe(headed=True, logger=logging.getLogger("ticketswap.pipeline"))
+            setattr(config, "STEP2_LAST_PROFILE_HEALTH", hr.status.value)
+            if hr.status != tvm.ProfileHealthStatus.trusted:
+                tvm.release_step2_profile_lock()
+                vps_lock_acquired = False
+                raise SystemExit(f"PROFILE_HEALTH still not trusted: status={hr.status.value}")
+    elif bool(getattr(args, "slow", False)):
+        du.apply_step2_slow_timings()
+
+    if headless:
+        config.warn_step2_headless_without_trusted_profile(logger=logging.getLogger("ticketswap.pipeline"))
+    else:
+        config.warn_if_step2_profile_missing(logger=logging.getLogger("ticketswap.pipeline"))
+
+    logging.info(
+        "Discovery headed=%s headless=%s headed_vps=%s profile_dir=%s interact=%s slow=%s",
+        bool(args.headed),
+        headless,
+        headed_vps,
+        str(config.ticketswap_profile_directory()),
+        bool(getattr(config, "STEP2_INTERACT_ENABLED", False)),
+        bool(getattr(config, "STEP2_SLOW_MODE", False)),
+    )
+
     conn = db.connect(config.DB_PATH)
     db.init_db(conn)
     run_id = db.create_pipeline_run(conn, mode="discovery", scope=scope_name)
@@ -875,6 +1032,11 @@ def run_discovery_mode(args: Any) -> int:
     if not configured_strategy:
         configured_strategy = str(getattr(config, "STEP2_DISCOVERY_STRATEGY", "hybrid_fast") or "hybrid_fast").strip().lower()
     browser_pref = str(getattr(args, "step2_browser", "auto"))
+    if use_vps_eighteen:
+        configured_strategy = "selenium_slow_hydrate"
+        browser_pref = "selenium"
+        # Do not churn retries per hub; we do a targeted rerun pass at the end for the 0-fresh hubs.
+        retries = 0
     if safe_mode and browser_pref == "auto":
         browser_pref = "selenium"
     page_timeout_ms = 75_000 if safe_mode else 45_000
@@ -883,7 +1045,7 @@ def run_discovery_mode(args: Any) -> int:
     inter_event_min = 2.0 if safe_mode else 0.2
     inter_event_max = 6.0 if safe_mode else 1.0
     counts: dict[str, int] = {
-        "listing_urls": len(listing_urls),
+        "listing_urls": len(hub_event_urls) if use_vps_eighteen else len(listing_urls),
         "events_collected": 0,
         "events_upserted": 0,
         "step2_fresh_ok": 0,
@@ -897,6 +1059,7 @@ def run_discovery_mode(args: Any) -> int:
     }
     step2_fresh_fail_event_urls: list[str] = []
     step2_fresh_fail_debug_dirs: set[str] = set()
+    vps18_zero_fresh: list[str] = []
 
     def _handle_event_step2(ev: str, step2: Step2Result) -> bool:
         nonlocal blocked_count, blocked_consecutive, stopped_early_blocked
@@ -938,6 +1101,8 @@ def run_discovery_mode(args: Any) -> int:
             step2_fresh_fail_event_urls.append(ev)
             if step2.debug_dir:
                 step2_fresh_fail_debug_dirs.add(step2.debug_dir)
+            if use_vps_eighteen and (step2.status != "blocked") and (not step2.ticket_urls):
+                vps18_zero_fresh.append(ev)
             if require_fresh_step2 and (not suppress_per_event_step2_alerts):
                 _send_error_alert(
                     error_type="step2_fresh_failure",
@@ -1008,24 +1173,14 @@ def run_discovery_mode(args: Any) -> int:
         return False
 
     try:
-        for listing_url in listing_urls:
-            if configured_strategy == "shared_listing_click":
-                shared_results = _discover_shared_listing_click(
-                    listing_url=listing_url,
-                    limit_events=int(args.limit_events),
-                    headed=bool(args.headed),
-                    debug=bool(args.debug),
-                    max_consecutive_blocked=2,
-                )
-                counts["events_collected"] += len(shared_results)
-                for ev, step2 in shared_results:
-                    _jitter(inter_event_min, inter_event_max)
-                    if _handle_event_step2(ev, step2):
-                        break
-            else:
-                events = _run_step1_events(listing_url, limit_events=args.limit_events, headless=headless)
-                counts["events_collected"] += len(events)
-                for ev in events:
+        if use_vps_eighteen:
+            shared_driver: Any | None = None
+            try:
+                shared_driver = du.new_driver(headless=headless)
+                counts["events_collected"] = len(hub_event_urls)
+                manual_press = bool(getattr(config, "STEP2_MANUAL_VERIFICATION_PRESS_ENTER", False))
+                dbg_dump = bool(getattr(config, "STEP2_DEBUG_DUMP_ON_FAILURE", False))
+                for ev in hub_event_urls:
                     _jitter(inter_event_min, inter_event_max)
                     step2, _, _, _verification_seen = _discover_live_with_retry(
                         ev,
@@ -1035,6 +1190,8 @@ def run_discovery_mode(args: Any) -> int:
                         verification_wait_seconds=verification_wait,
                         wait_for_manual_verification=wait_for_manual_verification,
                         manual_verification_timeout=300,
+                        manual_verification_press_enter=manual_press,
+                        debug_dump=dbg_dump,
                         retries=retries,
                         strategy=configured_strategy,
                         blocked_sleep_min=blocked_sleep_min,
@@ -1042,11 +1199,86 @@ def run_discovery_mode(args: Any) -> int:
                         page_timeout_ms=page_timeout_ms,
                         pre_network_wait_ms=pre_network_wait_ms,
                         post_network_wait_ms=post_network_wait_ms,
+                        existing_driver=shared_driver,
                     )
                     if _handle_event_step2(ev, step2):
                         break
-            if stopped_early_blocked:
-                break
+
+                # Targeted rerun ONLY for hubs that produced zero fresh URLs.
+                # This avoids retesting successful hubs while still giving "empty" hubs a second shot.
+                if vps18_zero_fresh:
+                    logging.warning("VPS18 rerun pass: %d hubs had zero fresh URLs", len(vps18_zero_fresh))
+                    for ev in list(dict.fromkeys(vps18_zero_fresh)):
+                        _jitter(inter_event_min, inter_event_max)
+                        step2, _, _, _verification_seen = _discover_live_with_retry(
+                            ev,
+                            headed=bool(args.headed),
+                            debug=True,
+                            browser=browser_pref,
+                            verification_wait_seconds=verification_wait,
+                            wait_for_manual_verification=wait_for_manual_verification,
+                            manual_verification_timeout=300,
+                            manual_verification_press_enter=manual_press,
+                            debug_dump=True,
+                            retries=0,
+                            strategy=configured_strategy,
+                            blocked_sleep_min=blocked_sleep_min,
+                            blocked_sleep_max=blocked_sleep_max,
+                            page_timeout_ms=page_timeout_ms,
+                            pre_network_wait_ms=pre_network_wait_ms,
+                            post_network_wait_ms=post_network_wait_ms,
+                            existing_driver=shared_driver,
+                        )
+                        _handle_event_step2(ev, step2)
+            finally:
+                if shared_driver is not None:
+                    with contextlib.suppress(Exception):
+                        shared_driver.quit()
+        else:
+            for listing_url in listing_urls:
+                if configured_strategy == "shared_listing_click":
+                    shared_results = _discover_shared_listing_click(
+                        listing_url=listing_url,
+                        limit_events=int(args.limit_events),
+                        headed=bool(args.headed),
+                        debug=bool(args.debug),
+                        max_consecutive_blocked=2,
+                    )
+                    counts["events_collected"] += len(shared_results)
+                    for ev, step2 in shared_results:
+                        _jitter(inter_event_min, inter_event_max)
+                        if _handle_event_step2(ev, step2):
+                            break
+                else:
+                    events = _run_step1_events(listing_url, limit_events=args.limit_events, headless=headless)
+                    counts["events_collected"] += len(events)
+                    for ev in events:
+                        _jitter(inter_event_min, inter_event_max)
+                        step2, _, _, _verification_seen = _discover_live_with_retry(
+                            ev,
+                            headed=bool(args.headed),
+                            debug=bool(args.debug),
+                            browser=browser_pref,
+                            verification_wait_seconds=verification_wait,
+                            wait_for_manual_verification=wait_for_manual_verification,
+                            manual_verification_timeout=300,
+                            manual_verification_press_enter=bool(
+                                getattr(config, "STEP2_MANUAL_VERIFICATION_PRESS_ENTER", False)
+                            ),
+                            debug_dump=bool(getattr(config, "STEP2_DEBUG_DUMP_ON_FAILURE", False)),
+                            retries=retries,
+                            strategy=configured_strategy,
+                            blocked_sleep_min=blocked_sleep_min,
+                            blocked_sleep_max=blocked_sleep_max,
+                            page_timeout_ms=page_timeout_ms,
+                            pre_network_wait_ms=pre_network_wait_ms,
+                            post_network_wait_ms=post_network_wait_ms,
+                            existing_driver=None,
+                        )
+                        if _handle_event_step2(ev, step2):
+                            break
+                if stopped_early_blocked:
+                    break
 
         paths = _export_mode_csvs(conn, Path("data/outputs"))
         final_status = "ok"
@@ -1097,6 +1329,8 @@ def run_discovery_mode(args: Any) -> int:
         logging.exception("Discovery mode failed")
         return 2
     finally:
+        if headed_vps and vps_lock_acquired:
+            tvm.release_step2_profile_lock()
         conn.close()
 
 

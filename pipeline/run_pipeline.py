@@ -5,11 +5,14 @@ Delegates to existing scripts/modules only — no changes to step1, step2, or sc
 
 Usage:
   python run_pipeline.py \\
+    --mode discovery \\
     --listing-url "https://www.ticketswap.com/festival-tickets?slug=festival-tickets&location=3" \\
     --limit-events 20 \\
-    --headed \\
+    --slow --interact --manual-verification \\
     --debug \\
     --out debug/pipeline_runs/pipeline_20_events.jsonl
+
+Default browser mode is headed (local STEP2). Use ``--headless`` or set ``TICKETSWAP_HEADLESS=1`` for servers.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import argparse
 import contextlib
 import json
 import logging
+import os
 import random
 import shutil
 import subprocess
@@ -56,7 +60,57 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     p.add_argument("--limit-events", type=int, default=20)
     p.add_argument("--limit-tickets", type=int, default=25)
-    p.add_argument("--headed", action="store_true", default=False, help="Run non-headless (recommended for verification).")
+    p.add_argument(
+        "--headed",
+        action="store_true",
+        default=False,
+        help="Force headed mode (default is already headed unless --headless or TICKETSWAP_HEADLESS=1).",
+    )
+    p.add_argument(
+        "--headless",
+        action="store_true",
+        default=False,
+        help="Run headless (STEP1/STEP2/market); overrides default headed local runs.",
+    )
+    p.add_argument(
+        "--headed-vps",
+        action="store_true",
+        default=False,
+        help="Discovery: headed_vps mode (sets TICKETSWAP_BROWSER_MODE). Never headless; requires profile + DISPLAY on Linux.",
+    )
+    p.add_argument(
+        "--vps-eighteen-hubs",
+        action="store_true",
+        default=False,
+        help="Discovery: scan the 18 canonical festival hub URLs in one Chrome session (recommended with --headed-vps).",
+    )
+    p.add_argument("--slow", action="store_true", default=False, help="Discovery: longer STEP2 page-ready waits.")
+    p.add_argument(
+        "--profile-dir",
+        type=str,
+        default="",
+        help="Discovery: Chrome user-data-dir (overrides TICKETSWAP_PROFILE_DIR for STEP2).",
+    )
+    p.add_argument(
+        "--anonymous-profile",
+        action="store_true",
+        default=False,
+        help="Discovery: ephemeral Chrome profile (no persisted TicketSwap session).",
+    )
+    p.add_argument("--interact", action="store_true", default=False, help="Discovery: enable STEP2 interaction rounds.")
+    p.add_argument("--no-interact", action="store_true", default=False, help="Discovery: disable STEP2 interaction rounds.")
+    p.add_argument(
+        "--manual-verification",
+        action="store_true",
+        default=False,
+        help="Discovery: when verification appears in headed STEP2, wait for Enter after solving in the browser.",
+    )
+    p.add_argument(
+        "--debug-dump",
+        action="store_true",
+        default=False,
+        help="Discovery: print per-event STEP2 diagnostics (URL, verification, counts).",
+    )
     p.add_argument("--debug", action="store_true", default=False)
     p.add_argument(
         "--scrape-market-in-discovery",
@@ -250,6 +304,14 @@ def _scrape_with_retry(
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if bool(getattr(args, "headed_vps", False)):
+        os.environ["TICKETSWAP_BROWSER_MODE"] = "headed_vps"
+    pd = str(getattr(args, "profile_dir", "") or "").strip()
+    if pd and str(getattr(args, "mode", "")) == "discovery":
+        os.environ["TICKETSWAP_PROFILE_DIR"] = str(Path(pd).expanduser().resolve())
+    if bool(getattr(args, "headed_vps", False)) and bool(getattr(args, "headless", False)):
+        raise SystemExit("Do not combine --headed-vps with --headless.")
+    args.headed = bool(du.resolve_discovery_headed(args))
     if args.mode == "discovery":
         return mode_runner.run_discovery_mode(args)
     if args.mode == "monitoring":
@@ -260,7 +322,7 @@ def main(argv: list[str]) -> int:
 
     listing_url = args.listing_url
     headed = bool(args.headed)
-    headless = not headed
+    headless = not bool(headed)
     manual_wait = int(getattr(config, "MANUAL_VERIFY_WAIT_SECONDS", 90)) if headed else 0
 
     out_path.write_text("", encoding="utf-8")

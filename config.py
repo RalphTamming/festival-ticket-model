@@ -7,10 +7,11 @@ This repo intentionally keeps configuration simple: edit this file or pass CLI f
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 try:
     from dotenv import load_dotenv
@@ -70,6 +71,61 @@ SEED_URLS: list[str] = [
 
 # When TicketSwap shows a verification page, keep the visible browser open for this many seconds.
 MANUAL_VERIFY_WAIT_SECONDS = 90
+
+# --- STEP2 / TicketSwap browser (mutable per-run; env defaults) ---
+# TICKETSWAP_HEADLESS=1 forces headless when CLI does not pass --headed/--headless (see discover_urls.resolve_discovery_headed).
+STEP2_SLOW_PAGE_READY_SECONDS = float(os.getenv("STEP2_SLOW_PAGE_READY", "38"))
+STEP2_SLOW_PAGE_LOAD_SECONDS = float(os.getenv("STEP2_SLOW_PAGE_LOAD", "6"))
+STEP2_INTERACTION_WAIT_SECONDS = float(os.getenv("STEP2_INTERACTION_WAIT", "2.5"))
+STEP2_INTERACT_ROUNDS = int(os.getenv("STEP2_INTERACT_ROUNDS", "3"))
+# mode_runner sets these before STEP2 Selenium work:
+STEP2_INTERACT_ENABLED: bool = False
+STEP2_DRIVER_USER_DATA_DIR: Optional[str] = None
+STEP2_USE_ANONYMOUS_PROFILE: bool = False
+STEP2_SLOW_MODE: bool = False
+STEP2_MANUAL_VERIFICATION_PRESS_ENTER: bool = False
+# headed_vps mode sets this True so failures persist rich debug bundles under tmp/ticketswap_debug/.
+STEP2_DEBUG_DUMP_ON_FAILURE: bool = False
+
+_STEP2_TIMING_BACKUP: dict[str, Any] = {}
+
+
+def ticketswap_profile_directory() -> Path:
+    """Resolved Chrome user-data dir for TicketSwap (env TICKETSWAP_PROFILE_DIR or BROWSER_PROFILE_DIR)."""
+    return Path(os.getenv("TICKETSWAP_PROFILE_DIR", str(BROWSER_PROFILE_DIR))).expanduser().resolve()
+
+
+def warn_if_step2_profile_missing(logger: Optional[logging.Logger] = None) -> None:
+    log = logger or logging.getLogger("ticketswap.config")
+    if not USE_PERSISTENT_BROWSER_PROFILE or STEP2_USE_ANONYMOUS_PROFILE:
+        return
+    p = ticketswap_profile_directory()
+    if not p.exists():
+        log.warning(
+            "No persistent TicketSwap profile directory at %s. "
+            "Login/trust state may be missing and TicketSwap verification is likely. "
+            "Log in once with headed Chrome using this path, or set TICKETSWAP_PROFILE_DIR.",
+            p,
+        )
+
+
+def warn_step2_headless_without_trusted_profile(logger: Optional[logging.Logger] = None) -> None:
+    """Headless VPS-style runs without a usable profile often hit verification-only HTML."""
+    log = logger or logging.getLogger("ticketswap.config")
+    if STEP2_USE_ANONYMOUS_PROFILE:
+        log.warning(
+            "STEP2 anonymous Chrome profile in use — no persisted TicketSwap session; verification may block extraction."
+        )
+        return
+    if not USE_PERSISTENT_BROWSER_PROFILE:
+        return
+    p = ticketswap_profile_directory()
+    if not p.exists():
+        log.warning(
+            "STEP2 headless with no profile at %s — set TICKETSWAP_PROFILE_DIR and TICKETSWAP_HEADLESS=0 "
+            "for trusted-session runs, or use headed Chrome/xvfb.",
+            p,
+        )
 
 # Mark URLs inactive only after missing N discovery runs.
 MISSING_RUNS_THRESHOLD = 3

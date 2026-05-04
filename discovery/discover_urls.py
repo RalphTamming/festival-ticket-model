@@ -26,6 +26,7 @@ import argparse
 import contextlib
 import base64
 import logging
+import os
 import random
 import re
 import time
@@ -41,6 +42,7 @@ from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 
 import config
 import db as dbmod
+from discovery import ticketswap_relaxed_extract as _tsx
 
 SUPPORTED_CATEGORY_PREFIXES: tuple[str, ...] = (
     "festival-tickets",
@@ -106,8 +108,11 @@ def normalize_url(url: str, base: str = "https://www.ticketswap.com") -> Optiona
 
 
 def is_ticket_url(url: str) -> bool:
-    p = urlparse(url)
-    return bool(TICKET_URL_RE.match(p.path or ""))
+    n = normalize_url(url) or url
+    p = urlparse(n).path or ""
+    if TICKET_URL_RE.match(p):
+        return True
+    return _tsx.path_matches_relaxed_festival_ticket(p)
 
 
 def is_festival_page(url: str) -> bool:
@@ -189,12 +194,16 @@ def event_url_from_ticket_url(ticket_url: str) -> Optional[str]:
     if not n:
         return None
     p = urlparse(n)
-    m = TICKET_URL_RE.match(p.path or "")
-    if not m:
-        return None
-    event_slug = m.group("event_slug")
-    category = m.group("category") if "category" in m.groupdict() else "festival-tickets"
-    return normalize_url(f"/{category}/{event_slug}")
+    path = p.path or ""
+    m = TICKET_URL_RE.match(path)
+    if m:
+        event_slug = m.group("event_slug")
+        category = m.group("category") if "category" in m.groupdict() else "festival-tickets"
+        return normalize_url(f"/{category}/{event_slug}")
+    eb = _tsx.event_base_path_from_relaxed_festival_ticket(path)
+    if eb:
+        return normalize_url(eb)
+    return None
 
 
 def ticket_type_from_ticket_url(ticket_url: str) -> tuple[Optional[str], Optional[str]]:
@@ -202,15 +211,156 @@ def ticket_type_from_ticket_url(ticket_url: str) -> tuple[Optional[str], Optiona
     if not n:
         return None, None
     p = urlparse(n)
-    m = TICKET_URL_RE.match(p.path or "")
-    if not m:
-        return None, None
-    slug = m.group("ticket_type_slug")
-    label = " ".join(w.capitalize() for w in slug.replace("-", " ").split()) if slug else None
-    return slug or None, label or None
+    path = p.path or ""
+    m = TICKET_URL_RE.match(path)
+    if m:
+        slug = m.group("ticket_type_slug")
+        label = " ".join(w.capitalize() for w in slug.replace("-", " ").split()) if slug else None
+        return slug or None, label or None
+    if _tsx.path_matches_relaxed_festival_ticket(path):
+        parts = [x for x in path.rstrip("/").split("/") if x]
+        if len(parts) >= 4 and parts[-1].isdigit():
+            slug = parts[-2]
+        elif len(parts) == 3 and parts[-1].isdigit():
+            slug = "tickets"
+        else:
+            slug = None
+        label = " ".join(w.capitalize() for w in slug.replace("-", " ").split()) if slug else None
+        return slug or None, label or None
+    return None, None
 
 
 LOGGER = logging.getLogger("ticketswap.discover")
+
+
+def resolve_discovery_headed(args: Any) -> bool:
+    """
+    Default: headed (local STEP2). Use --headless to disable.
+    TICKETSWAP_HEADLESS=1|true|yes forces headless when CLI does not pass --headed/--headless.
+
+    TICKETSWAP_BROWSER_MODE=headed_vps (or args.headed_vps) always returns headed=True.
+    """
+    try:
+        from discovery import ticketswap_vps_mode as tvm
+
+        if tvm.is_headed_vps_browser_mode(args):
+            return True
+    except Exception:
+        pass
+    if bool(getattr(args, "headless", False)):
+        return False
+    if bool(getattr(args, "headed", False)):
+        return True
+    env_h = str(os.getenv("TICKETSWAP_HEADLESS", "")).strip().lower()
+    if env_h in ("1", "true", "yes", "on"):
+        return False
+    return True
+
+
+def log_step2_verification_blocked(logger: logging.Logger, *, url: str) -> None:
+    logger.warning("STEP2_VERIFICATION_BLOCKED url=%s", url)
+
+
+def pause_manual_verification_enter(*, logger: Optional[logging.Logger] = None) -> None:
+    log = logger or LOGGER
+    log.warning(
+        "TicketSwap requires verification/login. Complete it in the opened browser, "
+        "then press Enter to continue."
+    )
+    try:
+        input()
+    except EOFError:
+        pass
+
+
+def apply_step2_slow_timings() -> None:
+    b = getattr(config, "_STEP2_TIMING_BACKUP", None)
+    if not isinstance(b, dict):
+        return
+    if b:
+        return
+    b["PAGE_READY_TIMEOUT_SECONDS"] = float(config.PAGE_READY_TIMEOUT_SECONDS)
+    b["PAGE_LOAD_SLEEP_SECONDS"] = float(config.PAGE_LOAD_SLEEP_SECONDS)
+    config.PAGE_READY_TIMEOUT_SECONDS = float(config.STEP2_SLOW_PAGE_READY_SECONDS)
+    config.PAGE_LOAD_SLEEP_SECONDS = float(config.STEP2_SLOW_PAGE_LOAD_SECONDS)
+    config.STEP2_SLOW_MODE = True
+
+
+def restore_step2_slow_timings() -> None:
+    b = getattr(config, "_STEP2_TIMING_BACKUP", None)
+    if not isinstance(b, dict) or not b:
+        config.STEP2_SLOW_MODE = False
+        return
+    for k, v in b.items():
+        setattr(config, k, v)
+    b.clear()
+    config.STEP2_SLOW_MODE = False
+
+
+def _step2_interaction_sleep() -> float:
+    base = float(getattr(config, "STEP2_INTERACTION_WAIT_SECONDS", 2.5))
+    if getattr(config, "STEP2_SLOW_MODE", False):
+        return base + random.uniform(0.4, 1.2)
+    return max(0.35, min(base, 1.0))
+
+
+def step2_interact_once(driver) -> None:
+    """Gradual scroll + EN/NL/FR load-more labels + aria-expanded=false (best-effort)."""
+    try:
+        for frac in (0.2, 0.45, 0.7, 1.0, 1.0):
+            with contextlib.suppress(Exception):
+                driver.execute_script(
+                    "window.scrollTo(0, Math.floor((document.body && document.body.scrollHeight || 0) * arguments[0]));",
+                    frac,
+                )
+            time.sleep(_step2_interaction_sleep() * 0.35)
+    except Exception:
+        LOGGER.debug("step2_interact_once scroll failed", exc_info=False)
+    with contextlib.suppress(Exception):
+        driver.execute_script(
+            r"""
+            function norm(t) { return String(t || '').toLowerCase().replace(/\s+/g, ' ').trim(); }
+            const needles = [
+              'show more', 'load more', 'more',
+              'meer', 'toon meer', 'laad meer', 'meer tonen',
+              'voir plus', 'afficher plus', 'charger plus'
+            ];
+            const root = document.querySelector('main') || document.body;
+            const els = Array.from(root.querySelectorAll('button, a, [role="button"]'));
+            let clicks = 0;
+            for (const el of els) {
+              if (clicks >= 14) break;
+              const t = norm(el.textContent || el.innerText || '');
+              if (!t) continue;
+              if (!needles.some(n => t.includes(n))) continue;
+              try {
+                el.scrollIntoView({block:'center', inline:'nearest'});
+                el.click();
+                clicks++;
+              } catch (e) {}
+            }
+            const closed = Array.from(root.querySelectorAll('[aria-expanded="false"]')).slice(0, 14);
+            for (const el of closed) {
+              if (clicks >= 22) break;
+              try {
+                el.scrollIntoView({block:'center', inline:'nearest'});
+                el.click();
+                clicks++;
+              } catch (e) {}
+            }
+            return clicks;
+            """
+        )
+    time.sleep(_step2_interaction_sleep())
+
+
+def run_step2_interaction_rounds(driver, *, max_rounds: Optional[int] = None) -> None:
+    if not getattr(config, "STEP2_INTERACT_ENABLED", False):
+        return
+    n = int(max_rounds if max_rounds is not None else getattr(config, "STEP2_INTERACT_ROUNDS", 3))
+    for _ in range(max(0, n)):
+        step2_interact_once(driver)
+        scroll_for_lazy_content(driver)
 
 
 def setup_logging(verbose: bool) -> None:
@@ -225,10 +375,28 @@ def setup_logging(verbose: bool) -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
-def new_driver(*, headless: bool, extra_args: Optional[Sequence[str]] = None) -> uc.Chrome:
+def new_driver(
+    *,
+    headless: bool,
+    extra_args: Optional[Sequence[str]] = None,
+    user_data_dir: Optional[str] = None,
+    use_persistent_profile: Optional[bool] = None,
+) -> uc.Chrome:
     def _build_kw() -> dict:
         options = uc.ChromeOptions()
-        config.apply_persistent_chrome_profile(options)
+        anon = bool(getattr(config, "STEP2_USE_ANONYMOUS_PROFILE", False))
+        raw_override = getattr(config, "STEP2_DRIVER_USER_DATA_DIR", None)
+        override_udd = str(Path(str(raw_override).strip()).resolve()) if (raw_override and str(raw_override).strip()) else None
+
+        if anon:
+            use_prof = False
+        elif use_persistent_profile is not None:
+            use_prof = bool(use_persistent_profile)
+        else:
+            use_prof = bool(getattr(config, "USE_PERSISTENT_BROWSER_PROFILE", True))
+
+        if use_prof:
+            config.apply_persistent_chrome_profile(options)
         if headless:
             options.add_argument("--headless=new")
         options.add_argument("--disable-blink-features=AutomationControlled")
@@ -240,10 +408,19 @@ def new_driver(*, headless: bool, extra_args: Optional[Sequence[str]] = None) ->
         for a in (extra_args or []):
             if a:
                 options.add_argument(str(a))
-        udd = config.persistent_browser_user_data_dir()
+        resolved_udd: Optional[str] = None
+        if anon:
+            resolved_udd = None
+        elif user_data_dir:
+            resolved_udd = str(Path(user_data_dir).resolve())
+        elif override_udd:
+            resolved_udd = override_udd
+        elif use_prof:
+            resolved_udd = config.persistent_browser_user_data_dir()
+
         kw: dict = dict(options=options, headless=headless, use_subprocess=True)
-        if udd is not None:
-            kw["user_data_dir"] = udd
+        if resolved_udd is not None:
+            kw["user_data_dir"] = resolved_udd
         if config.CHROME_VERSION_MAIN is not None:
             kw["version_main"] = config.CHROME_VERSION_MAIN
         return kw
@@ -282,10 +459,79 @@ def looks_like_verification(html: str) -> bool:
     )
 
 
+def looks_like_verification_html(
+    html: str,
+    *,
+    current_url: str = "",
+    title: str = "",
+    visible_text: str = "",
+) -> bool:
+    """
+    Broader TicketSwap / WAF / bot interstitial detection than ``looks_like_verification`` alone.
+    Use together with ``has_ticketswap_discovery_signal`` to decide if discovery is blocked.
+    """
+    if looks_like_verification(html):
+        return True
+    tl = (title or "").lower()
+    if any(
+        x in tl
+        for x in (
+            "verifying",
+            "just a moment",
+            "attention required",
+            "access denied",
+            "forbidden",
+            "robot check",
+        )
+    ):
+        return True
+    h = (html or "").lower()
+    vi = (visible_text or "").lower()
+    if any(
+        x in vi
+        for x in (
+            "verify you are human",
+            "checking your browser",
+            "unusual traffic",
+            "automated access",
+            "enable javascript",
+            "access denied",
+        )
+    ):
+        return True
+    if "cf-browser-verification" in h or "challenges.cloudflare.com" in h:
+        return True
+    if "captcha" in h and "ticketswap" in h and len(html or "") < 25_000:
+        return True
+    cur = (current_url or "").lower()
+    if "interstitial" in cur or "/challenge" in cur:
+        return True
+    return False
+
+
+def has_next_data_script(html: str) -> bool:
+    return bool(html) and "__NEXT_DATA__" in html
+
+
+def log_verification_blocked(
+    logger: logging.Logger,
+    *,
+    url: str,
+    title: str,
+    current_url: str,
+) -> None:
+    logger.warning(
+        "VERIFICATION_BLOCKED url=%s title=%r current_url=%r",
+        url,
+        (title or "")[:200],
+        (current_url or "")[:500],
+    )
+
+
 def _deep_ticket_path_pattern() -> str:
     """Regex fragment: /(category)/…/…/digits for any supported category."""
     cats = "|".join(re.escape(p) for p in SUPPORTED_CATEGORY_PREFIXES)
-    return rf"/(?:{cats})/[^\"'\s<>/]+/[^\"'\s<>/]+/\d+"
+    return rf"/(?:{cats})/[^\"'\s<>/]+/[^\"'\s<>/]+/\d{{5,}}"
 
 
 def has_ticketswap_discovery_signal(html: str) -> bool:
@@ -300,9 +546,23 @@ def has_ticketswap_discovery_signal(html: str) -> bool:
     return False
 
 
-def is_blocked_for_discovery(html: str) -> bool:
+def is_blocked_for_discovery(
+    html: str,
+    *,
+    title: str = "",
+    visible_text: str = "",
+    current_url: str = "",
+) -> bool:
     """True when a verification interstitial is shown and HTML lacks usable TicketSwap link signals."""
-    if not looks_like_verification(html):
+    if not (
+        looks_like_verification(html)
+        or looks_like_verification_html(
+            html,
+            current_url=current_url,
+            title=title,
+            visible_text=visible_text,
+        )
+    ):
         return False
     return not has_ticketswap_discovery_signal(html)
 
@@ -337,6 +597,10 @@ def scroll_for_lazy_content(driver) -> None:
             """
         )
         time.sleep(0.8)
+        if getattr(config, "STEP2_SLOW_MODE", False):
+            time.sleep(random.uniform(2.0, 4.0))
+        elif getattr(config, "STEP2_INTERACT_ENABLED", False):
+            time.sleep(_step2_interaction_sleep() * 0.45)
     except Exception:
         LOGGER.debug("scroll_for_lazy_content failed", exc_info=False)
 
@@ -374,7 +638,10 @@ def expand_main_accordions(driver, *, max_clicks: int = 24) -> None:
                 continue
         if not clicked:
             break
-        time.sleep(0.35)
+        if getattr(config, "STEP2_SLOW_MODE", False):
+            time.sleep(_step2_interaction_sleep())
+        else:
+            time.sleep(0.35)
 
 
 def try_click_tickets_tab(driver) -> bool:
@@ -646,6 +913,7 @@ def gather_link_candidates_dom_first(driver, html: str, base_url: str) -> set[st
     candidates |= json_links
     candidates |= deep_text
     candidates |= hub_html
+    candidates |= _tsx.extract_relaxed_festival_ticket_urls_from_html(html, base_url=base_url)
     cur = ""
     try:
         cur = normalize_url(getattr(driver, "current_url", "") or "") or (getattr(driver, "current_url", "") or "")
@@ -843,6 +1111,137 @@ def gather_hub_page_candidates(driver, hub_url: str) -> set[str]:
     return out
 
 
+def collect_festival_hub_ticket_urls(
+    driver,
+    hub_url: str,
+    *,
+    max_subpages: int = 16,
+    headless_for_wait: bool = True,
+    out_stats: Optional[dict[str, Any]] = None,
+) -> set[str]:
+    """
+    Hub ``/festival-tickets/a/<slug>``: expand UI, parse relaxed ticket URLs, follow linked
+    dated event pages, expand again, merge ticket URLs (pattern-only).
+    Skips subpage navigation when the hub (or a subpage) is verification/blocked.
+
+    If ``out_stats`` is provided, it may receive keys:
+    ``subpages_checked``, ``dated_event_count``, ``direct_hub_ticket_count``.
+    """
+    hub_n = normalize_url(hub_url) or hub_url
+    if out_stats is not None:
+        out_stats["subpages_checked"] = 0
+
+    def _title_visible() -> tuple[str, str]:
+        title = ""
+        vis = ""
+        with contextlib.suppress(Exception):
+            title = str(getattr(driver, "title", "") or "")
+        with contextlib.suppress(Exception):
+            vis = str(
+                driver.execute_script("return document.body && document.body.innerText") or ""
+            )
+        return title, vis
+
+    def _refresh_state() -> tuple[str, str, str, str]:
+        h_ = driver.page_source or ""
+        c_ = str(getattr(driver, "current_url", "") or "")
+        t_, v_ = _title_visible()
+        return h_, c_, t_, v_
+
+    tickets: set[str] = set()
+    scroll_for_lazy_content(driver)
+    with contextlib.suppress(Exception):
+        try_click_tickets_tab(driver)
+    expand_main_accordions(driver, max_clicks=20)
+    html, cur, title, vis = _refresh_state()
+    if is_blocked_for_discovery(html, title=title, visible_text=vis[:8000], current_url=cur):
+        if (not headless_for_wait) and getattr(config, "STEP2_MANUAL_VERIFICATION_PRESS_ENTER", False):
+            pause_manual_verification_enter(logger=LOGGER)
+            with contextlib.suppress(Exception):
+                driver.get(hub_n)
+            wait_for_page_content(driver, headless=bool(headless_for_wait))
+            html, cur, title, vis = _refresh_state()
+    if is_blocked_for_discovery(html, title=title, visible_text=vis[:8000], current_url=cur):
+        log_verification_blocked(LOGGER, url=hub_n, title=title, current_url=cur)
+        log_step2_verification_blocked(LOGGER, url=hub_n)
+        return set()
+
+    merged = merge_link_candidates(html, driver, hub_n)
+    for u in merged:
+        nu = normalize_url(u)
+        if nu and is_ticket_url(nu):
+            tickets.add(nu)
+    tickets |= _tsx.extract_relaxed_festival_ticket_urls_from_html(html, base_url=hub_n)
+    subs = _tsx.extract_hub_child_event_urls_from_html(html, hub_url=hub_n, extra_urls=merged)
+    subs.discard(hub_n)
+    if out_stats is not None:
+        out_stats["dated_event_count"] = len(subs)
+
+    if getattr(config, "STEP2_INTERACT_ENABLED", False):
+        n_rounds = int(getattr(config, "STEP2_INTERACT_ROUNDS", 3))
+        for _ in range(max(0, n_rounds)):
+            step2_interact_once(driver)
+            time.sleep(_step2_interaction_sleep())
+            scroll_for_lazy_content(driver)
+            expand_main_accordions(driver, max_clicks=16)
+            html = driver.page_source or ""
+            merged_i = merge_link_candidates(html, driver, hub_n)
+            for u in merged_i:
+                nu = normalize_url(u)
+                if nu and is_ticket_url(nu):
+                    tickets.add(nu)
+            tickets |= _tsx.extract_relaxed_festival_ticket_urls_from_html(html, base_url=hub_n)
+            subs |= _tsx.extract_hub_child_event_urls_from_html(html, hub_url=hub_n, extra_urls=merged_i)
+            subs.discard(hub_n)
+            if out_stats is not None:
+                out_stats["dated_event_count"] = len(subs)
+
+    if out_stats is not None:
+        out_stats["direct_hub_ticket_count"] = len(tickets)
+
+    for sub in sorted(subs)[: int(max_subpages)]:
+        sn = normalize_url(sub)
+        if not sn or sn == hub_n:
+            continue
+        try:
+            driver.get(sn)
+            time.sleep(0.9 if not getattr(config, "STEP2_SLOW_MODE", False) else _step2_interaction_sleep())
+            wait_for_page_content(driver, headless=bool(headless_for_wait))
+        except Exception:
+            continue
+        h2, cur2, t2, v2 = _refresh_state()
+        if is_blocked_for_discovery(h2, title=t2, visible_text=v2[:8000], current_url=cur2):
+            log_verification_blocked(LOGGER, url=sn, title=t2, current_url=cur2)
+            log_step2_verification_blocked(LOGGER, url=sn)
+            continue
+        if out_stats is not None:
+            out_stats["subpages_checked"] = int(out_stats.get("subpages_checked", 0)) + 1
+        scroll_for_lazy_content(driver)
+        with contextlib.suppress(Exception):
+            try_click_tickets_tab(driver)
+        expand_main_accordions(driver, max_clicks=18)
+        if getattr(config, "STEP2_INTERACT_ENABLED", False):
+            run_step2_interaction_rounds(driver)
+        revealed = reveal_event_page_deep_links(driver, sn)
+        h2 = driver.page_source or ""
+        m2 = merge_link_candidates(h2, driver, sn)
+        for u in m2 | revealed:
+            nu = normalize_url(u)
+            if nu and is_ticket_url(nu):
+                tickets.add(nu)
+        tickets |= _tsx.extract_relaxed_festival_ticket_urls_from_html(h2, base_url=sn)
+        for tu in extract_ticket_urls_from_eventtype_cache(h2, base_url=sn):
+            nu = normalize_url(tu)
+            if nu and is_ticket_url(nu):
+                tickets.add(nu)
+    try:
+        driver.get(hub_n)
+        time.sleep(0.35)
+    except Exception:
+        pass
+    return {u for u in tickets if u}
+
+
 def _save_discovery_debug(driver, *, label: str, url: str, html: str) -> None:
     """Persist HTML + screenshot for tricky discovery cases."""
     try:
@@ -1008,6 +1407,7 @@ def merge_link_candidates(html: str, driver, base_url: str) -> set[str]:
     s |= extract_hrefs_from_dom_js(driver)
     s |= extract_ticket_urls_from_page_text(html, base_url=base_url)
     s |= extract_ticket_urls_from_eventtype_cache(html, base_url=base_url)
+    s |= _tsx.extract_relaxed_festival_ticket_urls_from_html(html, base_url=base_url)
     return s
 
 
@@ -1151,7 +1551,8 @@ def expand_festival_overview_show_more(driver, *, max_clicks: int) -> int:
                 r"""
                 function norm(t) { return (t || '').replace(/\s+/g, ' ').trim().toLowerCase(); }
                 const root = document.querySelector('main') || document.body;
-                const needles = ['show more', 'load more', 'toon meer', 'meer tonen', 'more'];
+                const needles = ['show more', 'load more', 'toon meer', 'meer tonen', 'more', 'laad meer',
+                  'voir plus', 'afficher plus', 'charger plus'];
                 const els = Array.from(root.querySelectorAll('button, a, [role="button"]'));
                 let best = null;
                 for (const el of els) {
@@ -1159,7 +1560,7 @@ def expand_festival_overview_show_more(driver, *, max_clicks: int) -> int:
                   if (!t) continue;
                   if (!needles.some(n => t.includes(n))) continue;
                   best = el;
-                  if (t === 'show more' || t === 'load more' || t === 'toon meer') break;
+                  if (t === 'show more' || t === 'load more' || t === 'toon meer' || t === 'voir plus') break;
                 }
                 if (!best) return {found:false, clicked:false, disabled:false};
                 const disabled = best.hasAttribute('disabled') || best.getAttribute('aria-disabled') === 'true';
@@ -1892,7 +2293,8 @@ def expand_category_listing_show_more(
                 r"""
                 function norm(t) { return (t || '').replace(/\s+/g, ' ').trim().toLowerCase(); }
                 const root = document.querySelector('main') || document.body;
-                const needles = ['show more', 'load more', 'toon meer', 'meer tonen', 'more'];
+                const needles = ['show more', 'load more', 'toon meer', 'meer tonen', 'more', 'laad meer',
+                  'voir plus', 'afficher plus', 'charger plus'];
                 const els = Array.from(root.querySelectorAll('button, a, [role="button"]'));
                 let best = null;
                 for (const el of els) {
@@ -1900,7 +2302,7 @@ def expand_category_listing_show_more(
                   if (!t) continue;
                   if (!needles.some(n => t.includes(n))) continue;
                   best = el;
-                  if (t === 'show more' || t === 'load more' || t === 'toon meer') break;
+                  if (t === 'show more' || t === 'load more' || t === 'toon meer' || t === 'voir plus') break;
                 }
                 if (!best) return {found:false, clicked:false, disabled:false};
                 const disabled = best.hasAttribute('disabled') || best.getAttribute('aria-disabled') === 'true';
