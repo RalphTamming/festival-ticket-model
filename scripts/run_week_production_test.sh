@@ -11,6 +11,7 @@ touch "$LOG_FILE"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 DISCOVERY_SCOPE="western_europe_festivals_verified"
+# ~24h between discovery windows; scheduling uses next local midnight (see NEXT_DISCOVERY_EPOCH).
 DISCOVERY_INTERVAL_SECONDS=86400
 RUN_DURATION_SECONDS=$((7 * 24 * 3600))
 # Cap per-city events at 30 (i.e. each listing URL in the scope contributes up
@@ -41,9 +42,28 @@ export DAILY_REPORT_TIME="23:30"
 export TELEGRAM_ERROR_ONLY_MODE="true"
 export ENABLE_WEEKLY_EXPORT="false"
 
+# Discovery runs once per calendar day at this local time (default 00:00 Europe/Amsterdam).
+DISCOVERY_LOCAL_HOUR=0
+DISCOVERY_LOCAL_MINUTE=0
+
+next_discovery_epoch_local() {
+  python -c "
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+import sys
+tz = ZoneInfo(sys.argv[1])
+h, m = int(sys.argv[2]), int(sys.argv[3])
+now = datetime.now(tz)
+target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+if now >= target:
+    target += timedelta(days=1)
+print(int(target.timestamp()))
+" "$TZ_NAME" "${DISCOVERY_LOCAL_HOUR}" "${DISCOVERY_LOCAL_MINUTE}"
+}
+
 START_EPOCH="$(date +%s)"
 END_EPOCH="$((START_EPOCH + RUN_DURATION_SECONDS))"
-NEXT_DISCOVERY_EPOCH="$START_EPOCH"
+NEXT_DISCOVERY_EPOCH="$(next_discovery_epoch_local)"
 LAST_MONITOR_KEY=""
 LAST_SUMMARY_DATE=""
 
@@ -573,7 +593,7 @@ while true; do
       echo "[$(date -Is)] discovery failed; stopping week run."
       break
     fi
-    NEXT_DISCOVERY_EPOCH="$((now_epoch + DISCOVERY_INTERVAL_SECONDS))"
+    NEXT_DISCOVERY_EPOCH="$(next_discovery_epoch_local)"
   fi
 
   time_info="$(TZ="$TZ_NAME" date '+%Y-%m-%d %H %M %Y-%m-%dT%H')"

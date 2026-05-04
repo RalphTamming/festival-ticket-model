@@ -37,7 +37,7 @@ def _jitter(a: float = 0.4, b: float = 1.2) -> None:
 
 
 MAX_VPS18_DRIVER_RECOVERY_RESTARTS = 3
-RESTART_SHARED_DRIVER_EVERY_N_HUBS = 4
+RESTART_SHARED_DRIVER_EVERY_N_HUBS = 2
 
 
 def _is_selenium_driver_dead(exc: BaseException) -> bool:
