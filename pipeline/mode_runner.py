@@ -36,6 +36,44 @@ def _jitter(a: float = 0.4, b: float = 1.2) -> None:
     time.sleep(a + random.random() * max(0.0, b - a))
 
 
+MAX_VPS18_DRIVER_RECOVERY_RESTARTS = 3
+RESTART_SHARED_DRIVER_EVERY_N_HUBS = 4
+
+
+def _is_selenium_driver_dead(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(
+        needle in msg
+        for needle in (
+            "connection refused",
+            "max retries exceeded with url",
+            "invalid session id",
+            "disconnected",
+            "chrome not reachable",
+            "no such window",
+            "target window already closed",
+            "session deleted",
+        )
+    )
+
+
+def _driver_healthcheck(driver: Any) -> bool:
+    if driver is None:
+        return False
+    try:
+        _ = driver.current_url
+        return True
+    except Exception:
+        return False
+
+
+def _safe_driver_quit(driver: Any) -> None:
+    if driver is None:
+        return
+    with contextlib.suppress(Exception):
+        driver.quit()
+
+
 def _event_slug(event_url: str) -> str:
     n = du.normalize_url(event_url) or event_url
     path = (urlparse(n).path or "").strip("/")
@@ -710,7 +748,12 @@ def _discover_live_with_retry(
             if attempt < total_attempts - 1:
                 continue
             ev = du.normalize_url(event_url) or event_url
-            fr = "timeout" if "timeout" in str(e).lower() or "timeout" in type(e).__name__.lower() else "extraction_error"
+            if _is_selenium_driver_dead(e):
+                fr = "driver_session_lost"
+            elif "timeout" in str(e).lower() or "timeout" in type(e).__name__.lower():
+                fr = "timeout"
+            else:
+                fr = "extraction_error"
             return (
                 Step2Result(ev, "error", False, "none", [], debug_dir=None, failure_reason=fr),
                 attempt + 1,
@@ -1056,6 +1099,10 @@ def run_discovery_mode(args: Any) -> int:
         "ticket_types_fallback_upserted": 0,
         "stopped_early_blocked": 0,
         "step2_no_fresh": 0,
+        "shared_driver_restarts": 0,
+        "step2_driver_session_lost": 0,
+        "step2_hub_retry_after_driver_restart_ok": 0,
+        "vps18_driver_recovery_restarts": 0,
     }
     step2_fresh_fail_event_urls: list[str] = []
     step2_fresh_fail_debug_dirs: set[str] = set()
@@ -1084,7 +1131,10 @@ def run_discovery_mode(args: Any) -> int:
             blocked_consecutive = 0
         elif step2.status == "error":
             counts["step2_errors"] += 1
-            counts["step2_no_fresh"] += 1
+            if step2.failure_reason == "driver_session_lost":
+                counts["step2_driver_session_lost"] += 1
+            else:
+                counts["step2_no_fresh"] += 1
             blocked_consecutive = 0
             step2_fresh_fail_event_urls.append(ev)
             if step2.debug_dir:
@@ -1093,7 +1143,7 @@ def run_discovery_mode(args: Any) -> int:
                 error_type="step2_error",
                 event_url=ev,
                 debug_path=step2.debug_dir,
-                details=step2.status,
+                details=f"{step2.status} failure_reason={step2.failure_reason}",
             )
         else:
             blocked_consecutive = 0
@@ -1172,20 +1222,55 @@ def run_discovery_mode(args: Any) -> int:
             return True
         return False
 
+    vps18_discovery_fatal: Optional[str] = None
     try:
         if use_vps_eighteen:
             shared_driver: Any | None = None
+            recovery_restarts = 0
             try:
                 shared_driver = du.new_driver(headless=headless)
                 counts["events_collected"] = len(hub_event_urls)
                 manual_press = bool(getattr(config, "STEP2_MANUAL_VERIFICATION_PRESS_ENTER", False))
-                dbg_dump = bool(getattr(config, "STEP2_DEBUG_DUMP_ON_FAILURE", False))
-                for ev in hub_event_urls:
-                    _jitter(inter_event_min, inter_event_max)
-                    step2, _, _, _verification_seen = _discover_live_with_retry(
+                dbg_dump_default = bool(getattr(config, "STEP2_DEBUG_DUMP_ON_FAILURE", False))
+
+                def _vps18_log_restart(total: int, reason: str, hub: str) -> None:
+                    logging.warning(
+                        "[STEP2][VPS18] shared driver restart count=%s reason=%s hub=%s",
+                        total,
+                        reason,
+                        hub,
+                    )
+
+                def _vps18_recovery_restart(reason: str, hub: str) -> bool:
+                    nonlocal shared_driver, recovery_restarts
+                    if recovery_restarts >= MAX_VPS18_DRIVER_RECOVERY_RESTARTS:
+                        return False
+                    recovery_restarts += 1
+                    counts["vps18_driver_recovery_restarts"] = recovery_restarts
+                    counts["shared_driver_restarts"] += 1
+                    _vps18_log_restart(counts["shared_driver_restarts"], reason, hub)
+                    _safe_driver_quit(shared_driver)
+                    shared_driver = du.new_driver(headless=headless)
+                    return True
+
+                def _vps18_preventive_restart(hub: str) -> None:
+                    nonlocal shared_driver
+                    counts["shared_driver_restarts"] += 1
+                    _vps18_log_restart(
+                        counts["shared_driver_restarts"],
+                        "preventive_every_4_hubs",
+                        hub,
+                    )
+                    _safe_driver_quit(shared_driver)
+                    shared_driver = du.new_driver(headless=headless)
+
+                def _vps18_discover(
+                    ev: str, *, dbg: bool, dbg_dump: bool
+                ) -> tuple[Step2Result, int, Optional[str], bool]:
+                    return _discover_live_with_retry(
                         ev,
                         headed=bool(args.headed),
-                        debug=bool(args.debug),
+                        debug=dbg,
                         browser=browser_pref,
                         verification_wait_seconds=verification_wait,
                         wait_for_manual_verification=wait_for_manual_verification,
@@ -1201,35 +1286,167 @@ def run_discovery_mode(args: Any) -> int:
                         post_network_wait_ms=post_network_wait_ms,
                         existing_driver=shared_driver,
                     )
+
+                def _fatal_driver_step2(ev: str) -> Step2Result:
+                    evn = du.normalize_url(ev) or ev
+                    return Step2Result(
+                        evn,
+                        "error",
+                        False,
+                        "none",
+                        [],
+                        debug_dir=None,
+                        failure_reason="driver_session_lost",
+                    )
+
+                def _vps18_run_one_hub(
+                    hub_ix: int,
+                    ev: str,
+                    *,
+                    dbg: bool,
+                    dbg_dump: bool,
+                    skip_preventive: bool = False,
+                ) -> Step2Result:
+                    nonlocal shared_driver, vps18_discovery_fatal
+                    assert shared_driver is not None
+                    if (
+                        (not skip_preventive)
+                        and hub_ix > 1
+                        and (hub_ix - 1) % RESTART_SHARED_DRIVER_EVERY_N_HUBS == 0
+                    ):
+                        _vps18_preventive_restart(ev)
+                    if not _driver_healthcheck(shared_driver):
+                        if not _vps18_recovery_restart("healthcheck_preflight", ev):
+                            vps18_discovery_fatal = (
+                                f"Exceeded max VPS18 driver recovery restarts ({MAX_VPS18_DRIVER_RECOVERY_RESTARTS})"
+                            )
+                            return _fatal_driver_step2(ev)
+                    step2, _a, err_detail, _v = _vps18_discover(ev, dbg=dbg, dbg_dump=dbg_dump)
+                    needs_retry = (
+                        (not _driver_healthcheck(shared_driver))
+                        or (step2.status == "error" and step2.failure_reason == "driver_session_lost")
+                        or (bool(err_detail) and _is_selenium_driver_dead(RuntimeError(err_detail)))
+                    )
+                    if needs_retry:
+                        if not _vps18_recovery_restart("recover_after_step2_dead_session", ev):
+                            vps18_discovery_fatal = (
+                                f"Exceeded max VPS18 driver recovery restarts ({MAX_VPS18_DRIVER_RECOVERY_RESTARTS})"
+                            )
+                            return _fatal_driver_step2(ev)
+                        step2, _a2, err_detail2, _v2 = _vps18_discover(ev, dbg=dbg, dbg_dump=dbg_dump)
+                        if step2.status == "ok" and step2.ticket_urls:
+                            counts["step2_hub_retry_after_driver_restart_ok"] += 1
+                        elif (
+                            (not _driver_healthcheck(shared_driver))
+                            or (step2.status == "error" and step2.failure_reason == "driver_session_lost")
+                            or (bool(err_detail2) and _is_selenium_driver_dead(RuntimeError(err_detail2)))
+                        ):
+                            evn = du.normalize_url(ev) or ev
+                            step2 = Step2Result(
+                                evn,
+                                "error",
+                                False,
+                                "none",
+                                [],
+                                debug_dir=None,
+                                failure_reason="driver_session_lost",
+                            )
+                    return step2
+
+                for hub_ix, ev in enumerate(hub_event_urls, start=1):
+                    if vps18_discovery_fatal:
+                        break
+                    _jitter(inter_event_min, inter_event_max)
+                    try:
+                        step2 = _vps18_run_one_hub(
+                            hub_ix, ev, dbg=bool(args.debug), dbg_dump=dbg_dump_default
+                        )
+                    except Exception as e:
+                        if _is_selenium_driver_dead(e):
+                            if _vps18_recovery_restart("exception_during_step2", ev):
+                                try:
+                                    step2, _, _, _ = _vps18_discover(
+                                        ev, dbg=bool(args.debug), dbg_dump=dbg_dump_default
+                                    )
+                                    if step2.status == "ok" and step2.ticket_urls:
+                                        counts["step2_hub_retry_after_driver_restart_ok"] += 1
+                                except Exception as e2:
+                                    evn = du.normalize_url(ev) or ev
+                                    fr = (
+                                        "driver_session_lost"
+                                        if _is_selenium_driver_dead(e2)
+                                        else "extraction_error"
+                                    )
+                                    step2 = Step2Result(
+                                        evn,
+                                        "error",
+                                        False,
+                                        "none",
+                                        [],
+                                        debug_dir=None,
+                                        failure_reason=fr,
+                                    )
+                            else:
+                                vps18_discovery_fatal = (
+                                    f"Exceeded max VPS18 driver recovery restarts ({MAX_VPS18_DRIVER_RECOVERY_RESTARTS})"
+                                )
+                                step2 = _fatal_driver_step2(ev)
+                        else:
+                            raise
                     if _handle_event_step2(ev, step2):
+                        break
+                    if vps18_discovery_fatal:
                         break
 
                 # Targeted rerun ONLY for hubs that produced zero fresh URLs.
                 # This avoids retesting successful hubs while still giving "empty" hubs a second shot.
-                if vps18_zero_fresh:
+                if vps18_zero_fresh and (not vps18_discovery_fatal):
                     logging.warning("VPS18 rerun pass: %d hubs had zero fresh URLs", len(vps18_zero_fresh))
                     for ev in list(dict.fromkeys(vps18_zero_fresh)):
+                        if vps18_discovery_fatal:
+                            break
                         _jitter(inter_event_min, inter_event_max)
-                        step2, _, _, _verification_seen = _discover_live_with_retry(
-                            ev,
-                            headed=bool(args.headed),
-                            debug=True,
-                            browser=browser_pref,
-                            verification_wait_seconds=verification_wait,
-                            wait_for_manual_verification=wait_for_manual_verification,
-                            manual_verification_timeout=300,
-                            manual_verification_press_enter=manual_press,
-                            debug_dump=True,
-                            retries=0,
-                            strategy=configured_strategy,
-                            blocked_sleep_min=blocked_sleep_min,
-                            blocked_sleep_max=blocked_sleep_max,
-                            page_timeout_ms=page_timeout_ms,
-                            pre_network_wait_ms=pre_network_wait_ms,
-                            post_network_wait_ms=post_network_wait_ms,
-                            existing_driver=shared_driver,
-                        )
+                        try:
+                            step2 = _vps18_run_one_hub(
+                                1,
+                                ev,
+                                dbg=True,
+                                dbg_dump=True,
+                                skip_preventive=True,
+                            )
+                        except Exception as e:
+                            if _is_selenium_driver_dead(e):
+                                if _vps18_recovery_restart("exception_during_step2_rerun", ev):
+                                    try:
+                                        step2, _, _, _ = _vps18_discover(ev, dbg=True, dbg_dump=True)
+                                        if step2.status == "ok" and step2.ticket_urls:
+                                            counts["step2_hub_retry_after_driver_restart_ok"] += 1
+                                    except Exception as e2:
+                                        evn = du.normalize_url(ev) or ev
+                                        fr = (
+                                            "driver_session_lost"
+                                            if _is_selenium_driver_dead(e2)
+                                            else "extraction_error"
+                                        )
+                                        step2 = Step2Result(
+                                            evn,
+                                            "error",
+                                            False,
+                                            "none",
+                                            [],
+                                            debug_dir=None,
+                                            failure_reason=fr,
+                                        )
+                                else:
+                                    vps18_discovery_fatal = (
+                                        f"Exceeded max VPS18 driver recovery restarts ({MAX_VPS18_DRIVER_RECOVERY_RESTARTS})"
+                                    )
+                                    step2 = _fatal_driver_step2(ev)
+                            else:
+                                raise
                         _handle_event_step2(ev, step2)
+                        if vps18_discovery_fatal:
+                            break
             finally:
                 if shared_driver is not None:
                     with contextlib.suppress(Exception):
@@ -1282,11 +1499,19 @@ def run_discovery_mode(args: Any) -> int:
 
         paths = _export_mode_csvs(conn, Path("data/outputs"))
         final_status = "ok"
-        if require_fresh_step2 and (counts["ticket_types_fresh_upserted"] == 0):
+        if vps18_discovery_fatal:
+            final_status = "failed"
+        elif require_fresh_step2 and (counts["ticket_types_fresh_upserted"] == 0):
             final_status = "verification_blocked"
         elif stopped_early_blocked or (counts["step2_blocked"] > 0 and counts["ticket_types_fresh_upserted"] == 0):
             final_status = "verification_blocked_partial"
-        db.finish_pipeline_run(conn, run_id=run_id, status=final_status, counts=counts, error_summary=None)
+        db.finish_pipeline_run(
+            conn,
+            run_id=run_id,
+            status=final_status,
+            counts=counts,
+            error_summary=vps18_discovery_fatal if vps18_discovery_fatal else None,
+        )
         if blocked_count >= 5 and (not suppress_per_event_step2_alerts):
             _send_error_alert(
                 error_type="verification_blocked_threshold_exceeded",
@@ -1310,6 +1535,8 @@ def run_discovery_mode(args: Any) -> int:
                 f"fresh_success={counts.get('step2_fresh_ok', 0)}",
                 f"blocked={counts.get('step2_blocked', 0)}",
                 f"no_fresh_ticket={counts.get('step2_no_fresh', 0)}",
+                f"driver_session_lost={counts.get('step2_driver_session_lost', 0)}",
+                f"shared_driver_restarts={counts.get('shared_driver_restarts', 0)}",
                 f"failed_events_top10={top_failed}",
                 f"debug_dir={debug_root}",
             ]
@@ -1322,6 +1549,8 @@ def run_discovery_mode(args: Any) -> int:
         _maybe_send_daily_outputs(conn, datetime.now(ZoneInfo(getattr(config, "LOCAL_TIMEZONE", "Europe/Amsterdam"))))
         print(json.dumps({"run_id": run_id, "mode": "discovery", "status": final_status, "counts": counts}, indent=2))
         print(f"CSV exports: {', '.join(str(p) for p in paths.values())}")
+        if vps18_discovery_fatal:
+            return 7
         return 3 if stopped_early_blocked else 0
     except Exception as exc:
         db.finish_pipeline_run(conn, run_id=run_id, status="failed", counts=counts, error_summary=str(exc))
