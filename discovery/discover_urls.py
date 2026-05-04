@@ -405,6 +405,17 @@ def new_driver(
         options.add_argument("--no-default-browser-check")
         options.add_argument("--disable-notifications")
         options.add_argument("--disable-popup-blocking")
+        # VPS / systemd containers commonly run browsers as root. Modern Chrome refuses to start
+        # without an explicit sandbox opt-out on Linux in that situation.
+        if sys.platform.startswith("linux"):
+            try:
+                if os.geteuid() == 0:
+                    options.add_argument("--no-sandbox")
+                    options.add_argument("--disable-setuid-sandbox")
+                    options.add_argument("--disable-dev-shm-usage")
+            except AttributeError:
+                # Non-Unix platforms.
+                pass
         for a in (extra_args or []):
             if a:
                 options.add_argument(str(a))
