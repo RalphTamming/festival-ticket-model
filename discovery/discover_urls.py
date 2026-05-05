@@ -458,7 +458,26 @@ def new_driver(
         else:
             opt_bin = Path("/opt/google/chrome/chrome")
             if opt_bin.is_file():
-                options.binary_location = str(opt_bin)
+                # Chrome refuses `--version` as root without --no-sandbox; chromedriver runs a
+                # binary-probe without user flags and will treat that as "no chrome binary".
+                # Use a tiny wrapper so both the probe and normal launches work as root.
+                if sys.platform.startswith("linux"):
+                    try:
+                        if os.geteuid() == 0:
+                            wrapper = Path("/tmp/ticketswap_chrome_wrapper_no_sandbox.sh")
+                            wrapper.write_text(
+                                "#!/usr/bin/env bash\n"
+                                "exec /opt/google/chrome/chrome --no-sandbox --disable-setuid-sandbox \"$@\"\n",
+                                encoding="utf-8",
+                            )
+                            os.chmod(wrapper, 0o755)
+                            options.binary_location = str(wrapper)
+                        else:
+                            options.binary_location = str(opt_bin)
+                    except Exception:
+                        options.binary_location = str(opt_bin)
+                else:
+                    options.binary_location = str(opt_bin)
         if resolved_udd:
             options.add_argument(f"--user-data-dir={resolved_udd}")
         # Prefer a system chromedriver when present; Selenium Manager can be unreliable on minimal VPS images.
