@@ -448,6 +448,15 @@ def new_driver(
 
         options = Options()
         _common_options(options, use_prof=use_prof)
+        # Some VPS images install Chrome under /opt/... while Selenium defaults to /usr/bin/google-chrome.
+        # Allow explicit override and prefer the real chrome binary when present.
+        override_bin = str(os.getenv("TICKETSWAP_CHROME_BINARY", "") or "").strip()
+        if override_bin:
+            options.binary_location = override_bin
+        else:
+            opt_bin = Path("/opt/google/chrome/chrome")
+            if opt_bin.is_file():
+                options.binary_location = str(opt_bin)
         if resolved_udd:
             options.add_argument(f"--user-data-dir={resolved_udd}")
         # Selenium 4.6+ uses Selenium Manager when no driver path is specified.
