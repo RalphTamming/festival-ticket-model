@@ -36,8 +36,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-import undetected_chromedriver as uc
-
 import json
 from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 
@@ -383,20 +381,35 @@ def new_driver(
     extra_args: Optional[Sequence[str]] = None,
     user_data_dir: Optional[str] = None,
     use_persistent_profile: Optional[bool] = None,
-) -> uc.Chrome:
-    def _build_kw() -> dict:
-        options = uc.ChromeOptions()
-        anon = bool(getattr(config, "STEP2_USE_ANONYMOUS_PROFILE", False))
+) -> Any:
+    def _driver_impl() -> str:
+        return str(os.getenv("TICKETSWAP_DRIVER_IMPL", "uc") or "uc").strip().lower()
+
+    def _resolved_user_data_dir(*, anon: bool, use_prof: bool) -> Optional[str]:
         raw_override = getattr(config, "STEP2_DRIVER_USER_DATA_DIR", None)
-        override_udd = str(Path(str(raw_override).strip()).resolve()) if (raw_override and str(raw_override).strip()) else None
-
+        override_udd = (
+            str(Path(str(raw_override).strip()).resolve())
+            if (raw_override and str(raw_override).strip())
+            else None
+        )
         if anon:
-            use_prof = False
-        elif use_persistent_profile is not None:
-            use_prof = bool(use_persistent_profile)
-        else:
-            use_prof = bool(getattr(config, "USE_PERSISTENT_BROWSER_PROFILE", True))
+            return None
+        if user_data_dir:
+            return str(Path(user_data_dir).resolve())
+        if override_udd:
+            return override_udd
+        if use_prof:
+            return config.persistent_browser_user_data_dir()
+        return None
 
+    def _use_persistent_profile(*, anon: bool) -> bool:
+        if anon:
+            return False
+        if use_persistent_profile is not None:
+            return bool(use_persistent_profile)
+        return bool(getattr(config, "USE_PERSISTENT_BROWSER_PROFILE", True))
+
+    def _common_options(options: Any, *, use_prof: bool) -> None:
         if use_prof:
             config.apply_persistent_chrome_profile(options)
         if headless:
@@ -407,8 +420,8 @@ def new_driver(
         options.add_argument("--no-default-browser-check")
         options.add_argument("--disable-notifications")
         options.add_argument("--disable-popup-blocking")
-        # VPS / systemd containers commonly run browsers as root. Modern Chrome refuses to start
-        # without an explicit sandbox opt-out on Linux in that situation.
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
         if sys.platform.startswith("linux"):
             try:
                 if os.geteuid() == 0:
@@ -416,30 +429,48 @@ def new_driver(
                     options.add_argument("--disable-setuid-sandbox")
                     options.add_argument("--disable-dev-shm-usage")
             except AttributeError:
-                # Non-Unix platforms.
                 pass
         for a in (extra_args or []):
             if a:
                 options.add_argument(str(a))
-        resolved_udd: Optional[str] = None
-        if anon:
-            resolved_udd = None
-        elif user_data_dir:
-            resolved_udd = str(Path(user_data_dir).resolve())
-        elif override_udd:
-            resolved_udd = override_udd
-        elif use_prof:
-            resolved_udd = config.persistent_browser_user_data_dir()
 
+    impl = _driver_impl()
+    log = logging.getLogger("ticketswap.chrome")
+
+    anon = bool(getattr(config, "STEP2_USE_ANONYMOUS_PROFILE", False))
+    use_prof = _use_persistent_profile(anon=anon)
+    resolved_udd = _resolved_user_data_dir(anon=anon, use_prof=use_prof)
+
+    if impl == "selenium":
+        log.warning("[Chrome] using selenium webdriver implementation")
+        from selenium import webdriver  # local import: allow VPS to bypass UC entirely
+        from selenium.webdriver.chrome.options import Options
+
+        options = Options()
+        _common_options(options, use_prof=use_prof)
+        if resolved_udd:
+            options.add_argument(f"--user-data-dir={resolved_udd}")
+        # Selenium 4.6+ uses Selenium Manager when no driver path is specified.
+        return webdriver.Chrome(options=options)
+
+    # Default: undetected-chromedriver
+    from undetected_chromedriver import Chrome as _UcChrome  # type: ignore
+    from undetected_chromedriver import ChromeOptions as _UcChromeOptions  # type: ignore
+
+    def _build_kw_uc() -> dict:
+        options = _UcChromeOptions()
+        anon = bool(getattr(config, "STEP2_USE_ANONYMOUS_PROFILE", False))
+        use_prof = _use_persistent_profile(anon=anon)
+        _common_options(options, use_prof=use_prof)
         kw: dict = dict(options=options, headless=headless, use_subprocess=True)
         if resolved_udd is not None:
             kw["user_data_dir"] = resolved_udd
         if config.CHROME_VERSION_MAIN is not None:
             kw["version_main"] = config.CHROME_VERSION_MAIN
         return kw
+
     # undetected-chromedriver can race when patching the driver binary or when stale Chrome
     # processes hold the profile / ports on VPS. Retries + optional clean-slate improve reliability.
-    log = logging.getLogger("ticketswap.chrome")
     last_err: Optional[Exception] = None
     max_attempts = 5
     for attempt in range(max_attempts):
@@ -450,7 +481,7 @@ def new_driver(
             headless,
         )
         try:
-            return uc.Chrome(**_build_kw())
+            return _UcChrome(**_build_kw_uc())
         except FileExistsError as e:
             last_err = e
             _vcb.run_clean_slate_after_failed_chrome_startup(logger=log)

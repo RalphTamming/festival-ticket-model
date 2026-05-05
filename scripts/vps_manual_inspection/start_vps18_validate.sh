@@ -9,6 +9,8 @@ source ".venv/bin/activate"
 export TICKETSWAP_BROWSER_MODE=headed_vps
 export TICKETSWAP_HEADLESS=0
 export DISPLAY="${DISPLAY:-:99}"
+# Default to stable selenium chromedriver on VPS (override allowed).
+export TICKETSWAP_DRIVER_IMPL="${TICKETSWAP_DRIVER_IMPL:-selenium}"
 export TICKETSWAP_VPS_CLEAN_SLATE=1
 export TICKETSWAP_VPS_ENSURE_XVFB=1
 : > logs/vps18_validate2.log

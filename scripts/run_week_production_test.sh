@@ -262,6 +262,8 @@ run_discovery() {
   export DISPLAY="${DISPLAY:-:99}"
   export TICKETSWAP_HEADLESS=0
   export TICKETSWAP_BROWSER_MODE=headed_vps
+  # UC proved unstable on this VPS; default to normal selenium chromedriver.
+  export TICKETSWAP_DRIVER_IMPL="${TICKETSWAP_DRIVER_IMPL:-selenium}"
   export TICKETSWAP_VPS_CLEAN_SLATE="${TICKETSWAP_VPS_CLEAN_SLATE:-1}"
   export TICKETSWAP_VPS_ENSURE_XVFB="${TICKETSWAP_VPS_ENSURE_XVFB:-1}"
   if [[ -z "${TICKETSWAP_PROFILE_DIR:-}" ]] && [[ -d "/opt/ticketswap/profile" ]]; then
