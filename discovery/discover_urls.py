@@ -481,19 +481,26 @@ def new_driver(
         if resolved_udd:
             options.add_argument(f"--user-data-dir={resolved_udd}")
         # Prefer a system chromedriver when present; Selenium Manager can be unreliable on minimal VPS images.
+        use_system = str(os.getenv("TICKETSWAP_USE_SYSTEM_CHROMEDRIVER", "1") or "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
         drv_override = str(os.getenv("TICKETSWAP_CHROMEDRIVER_PATH", "") or "").strip()
-        candidates: list[str] = []
-        if drv_override:
-            candidates.append(drv_override)
-        # Ubuntu's chromium-chromedriver package installs the real binary here; /usr/bin/chromedriver
-        # can be a small wrapper that fails to locate non-snap chrome binaries.
-        candidates.append("/usr/lib/chromium-browser/chromedriver")
-        wh = shutil.which("chromedriver")
-        if wh:
-            candidates.append(wh)
-        drv_path = next((p for p in candidates if p and Path(p).is_file()), "")
-        if drv_path:
-            return webdriver.Chrome(service=Service(executable_path=drv_path), options=options)
+        if use_system:
+            candidates: list[str] = []
+            if drv_override:
+                candidates.append(drv_override)
+            # Ubuntu's chromium-chromedriver package installs a binary here; /usr/bin/chromedriver
+            # may be a wrapper.
+            candidates.append("/usr/lib/chromium-browser/chromedriver")
+            wh = shutil.which("chromedriver")
+            if wh:
+                candidates.append(wh)
+            drv_path = next((p for p in candidates if p and Path(p).is_file()), "")
+            if drv_path:
+                return webdriver.Chrome(service=Service(executable_path=drv_path), options=options)
         # Selenium 4.6+ uses Selenium Manager when no driver path is specified.
         return webdriver.Chrome(options=options)
 
