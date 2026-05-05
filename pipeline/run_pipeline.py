@@ -32,6 +32,34 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
+
+def _bootstrap_profile_dir_from_argv(argv: list[str]) -> None:
+    """
+    Apply ``--profile-dir`` before ``import config`` so ``load_dotenv()`` does not pin
+    ``TICKETSWAP_PROFILE_DIR`` from ``.env`` when the CLI overrides it for discovery.
+    """
+    try:
+        mi = argv.index("--mode")
+        if mi + 1 >= len(argv) or argv[mi + 1] != "discovery":
+            return
+    except ValueError:
+        return
+    pd = ""
+    for i, a in enumerate(argv):
+        if a == "--profile-dir" and i + 1 < len(argv):
+            pd = argv[i + 1]
+            break
+        if a.startswith("--profile-dir="):
+            pd = a.split("=", 1)[1]
+            break
+    pd = str(pd).strip()
+    if pd:
+        os.environ["TICKETSWAP_PROFILE_DIR"] = str(Path(pd).expanduser().resolve())
+
+
+if __name__ == "__main__":
+    _bootstrap_profile_dir_from_argv(sys.argv[1:])
+
 import config
 from discovery import discover_urls as du
 from pipeline import mode_runner
