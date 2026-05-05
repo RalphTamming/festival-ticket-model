@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 import config
 import db
 from discovery import discover_urls as du
+from discovery import vps_chrome_bootstrap as vcb
 from discovery.step2_discover_ticket_urls import (
     Step2Result,
     classify_loaded_selenium_page,
@@ -1005,6 +1006,8 @@ def run_discovery_mode(args: Any) -> int:
     setattr(config, "STEP2_LAST_PROFILE_HEALTH", "unknown")
     vps_lock_acquired = False
     if headed_vps:
+        vcb.run_clean_slate_if_enabled(logger=logging.getLogger("ticketswap.pipeline"))
+        vcb.run_ensure_xvfb_if_enabled(logger=logging.getLogger("ticketswap.pipeline"))
         tvm.validate_headed_vps_prerequisites(profile_dir=config.ticketswap_profile_directory(), allow_anonymous=False)
         tvm.apply_headed_vps_runtime_defaults()
         try:
@@ -1250,6 +1253,8 @@ def run_discovery_mode(args: Any) -> int:
                     counts["shared_driver_restarts"] += 1
                     _vps18_log_restart(counts["shared_driver_restarts"], reason, hub)
                     _safe_driver_quit(shared_driver)
+                    vcb.run_clean_slate_if_enabled(logger=logging.getLogger("ticketswap.pipeline"))
+                    time.sleep(2.0)
                     shared_driver = du.new_driver(headless=headless)
                     return True
 
@@ -1258,10 +1263,12 @@ def run_discovery_mode(args: Any) -> int:
                     counts["shared_driver_restarts"] += 1
                     _vps18_log_restart(
                         counts["shared_driver_restarts"],
-                        "preventive_every_4_hubs",
+                        f"preventive_every_{RESTART_SHARED_DRIVER_EVERY_N_HUBS}_hubs",
                         hub,
                     )
                     _safe_driver_quit(shared_driver)
+                    vcb.run_clean_slate_if_enabled(logger=logging.getLogger("ticketswap.pipeline"))
+                    time.sleep(1.5)
                     shared_driver = du.new_driver(headless=headless)
 
                 def _vps18_discover(

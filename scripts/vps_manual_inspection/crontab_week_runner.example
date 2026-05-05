@@ -1,0 +1,4 @@
+# Append with: crontab -e
+# Runs the week runner daily at 00:00 Europe/Amsterdam (calendar day boundary in that TZ).
+CRON_TZ=Europe/Amsterdam
+0 0 * * * cd /root/festival-ticket-model && bash scripts/vps_manual_inspection/_launch_week.sh >> logs/week_runner_cron.log 2>&1

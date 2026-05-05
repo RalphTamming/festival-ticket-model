@@ -257,10 +257,29 @@ run_discovery() {
   echo "=== DISCOVERY START $(date -Is) ==="
   local tmp_log
   tmp_log="$(mktemp)"
-  xvfb-run -a python run_pipeline.py \
+
+  # Align with validated headed_vps + persistent profile (not xvfb-run + --headed).
+  export DISPLAY="${DISPLAY:-:99}"
+  export TICKETSWAP_HEADLESS=0
+  export TICKETSWAP_BROWSER_MODE=headed_vps
+  export TICKETSWAP_VPS_CLEAN_SLATE="${TICKETSWAP_VPS_CLEAN_SLATE:-1}"
+  export TICKETSWAP_VPS_ENSURE_XVFB="${TICKETSWAP_VPS_ENSURE_XVFB:-1}"
+  if [[ -z "${TICKETSWAP_PROFILE_DIR:-}" ]] && [[ -d "/opt/ticketswap/profile" ]]; then
+    export TICKETSWAP_PROFILE_DIR="/opt/ticketswap/profile"
+  fi
+  bash "$ROOT_DIR/scripts/vps_chrome_clean_slate.sh" || true
+  bash "$ROOT_DIR/scripts/vps_ensure_xvfb.sh" || true
+
+  local profile_args=()
+  if [[ -n "${TICKETSWAP_PROFILE_DIR:-}" ]]; then
+    profile_args=(--profile-dir "$TICKETSWAP_PROFILE_DIR")
+  fi
+
+  python run_pipeline.py \
     --mode discovery \
     --scope "$DISCOVERY_SCOPE" \
-    --headed \
+    --headed-vps \
+    "${profile_args[@]}" \
     --limit-events "$LIMIT_EVENTS_PER_CITY" \
     --vps-safe-mode \
     --step2-browser selenium \

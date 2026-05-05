@@ -131,6 +131,12 @@ def step2_profile_lock(profile_dir: Path, *, logger: Optional[logging.Logger] = 
             raise ProfileLockError(
                 "Profile already in use. Stop the other STEP2/Chrome process or use a different profile."
             )
+        if other is not None:
+            log.warning(
+                "Removing stale STEP2 profile lock (recorded pid=%s is not alive): %s",
+                other,
+                lock_path,
+            )
         with contextlib.suppress(Exception):
             lock_path.unlink()
         if not _try_acquire():

@@ -44,6 +44,7 @@ from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 import config
 import db as dbmod
 from discovery import ticketswap_relaxed_extract as _tsx
+from discovery import vps_chrome_bootstrap as _vcb
 
 SUPPORTED_CATEGORY_PREFIXES: tuple[str, ...] = (
     "festival-tickets",
@@ -436,25 +437,40 @@ def new_driver(
         if config.CHROME_VERSION_MAIN is not None:
             kw["version_main"] = config.CHROME_VERSION_MAIN
         return kw
-    # undetected-chromedriver can occasionally race on Windows when patching the driver binary.
-    # A small retry makes the pipeline much more reliable.
+    # undetected-chromedriver can race when patching the driver binary or when stale Chrome
+    # processes hold the profile / ports on VPS. Retries + optional clean-slate improve reliability.
+    log = logging.getLogger("ticketswap.chrome")
     last_err: Optional[Exception] = None
-    for _ in range(5):
+    max_attempts = 5
+    for attempt in range(max_attempts):
+        log.warning(
+            "[Chrome] uc.Chrome startup attempt %s/%s headless=%s",
+            attempt + 1,
+            max_attempts,
+            headless,
+        )
         try:
             return uc.Chrome(**_build_kw())
         except FileExistsError as e:
             last_err = e
+            _vcb.run_clean_slate_after_failed_chrome_startup(logger=log)
             time.sleep(0.8)
         except Exception as e:
             # Retry only for known flaky startup conditions.
             msg = str(e).lower()
             if "session not created" in msg or "chrome not reachable" in msg:
                 last_err = e
+                _vcb.run_clean_slate_after_failed_chrome_startup(logger=log)
                 time.sleep(1.2)
                 continue
-            if "remote end closed connection without response" in msg or "connection aborted" in msg:
-                # Seen under UC startup contention/network race when spawning local driver service.
+            if (
+                "remote end closed connection without response" in msg
+                or "connection aborted" in msg
+                or "connection refused" in msg
+                or "remotedisconnected" in msg.replace(" ", "")
+            ):
                 last_err = e
+                _vcb.run_clean_slate_after_failed_chrome_startup(logger=log)
                 time.sleep(1.5)
                 continue
             raise
