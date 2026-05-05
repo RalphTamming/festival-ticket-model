@@ -57,8 +57,7 @@ def _bootstrap_profile_dir_from_argv(argv: list[str]) -> None:
         os.environ["TICKETSWAP_PROFILE_DIR"] = str(Path(pd).expanduser().resolve())
 
 
-if __name__ == "__main__":
-    _bootstrap_profile_dir_from_argv(sys.argv[1:])
+_bootstrap_profile_dir_from_argv(sys.argv[1:])
 
 import config
 from discovery import discover_urls as du
