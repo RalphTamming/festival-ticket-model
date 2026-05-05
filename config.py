@@ -28,6 +28,8 @@ DEBUG_DIR = Path("data/debug")
 
 
 # --- Browser (Selenium + undetected-chromedriver) ---
+# TICKETSWAP_DRIVER_IMPL: "uc" (default, undetected_chromedriver) or "selenium" (stock ChromeDriver).
+# On VPS where UC is unstable, use TICKETSWAP_DRIVER_IMPL=selenium (see discovery_urls.new_driver).
 # Dedicated Chrome user-data dir (not your personal browser). Keeps TicketSwap login across runs.
 USE_PERSISTENT_BROWSER_PROFILE = True
 BROWSER_PROFILE_DIR = Path(os.getenv("TICKETSWAP_PROFILE_DIR", ".ticketswap_browser_profile"))

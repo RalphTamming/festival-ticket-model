@@ -450,34 +450,20 @@ def new_driver(
 
         options = Options()
         _common_options(options, use_prof=use_prof)
+        # Headed Chrome on VPS commonly needs these even for non-root automation users.
+        if sys.platform.startswith("linux"):
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-setuid-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
         # Some VPS images install Chrome under /opt/... while Selenium defaults to /usr/bin/google-chrome.
-        # Allow explicit override and prefer the real chrome binary when present.
+        # Allow explicit override and prefer the Google Chrome stable binary when present.
         override_bin = str(os.getenv("TICKETSWAP_CHROME_BINARY", "") or "").strip()
         if override_bin:
             options.binary_location = override_bin
         else:
             opt_bin = Path("/opt/google/chrome/chrome")
             if opt_bin.is_file():
-                # Chrome refuses `--version` as root without --no-sandbox; chromedriver runs a
-                # binary-probe without user flags and will treat that as "no chrome binary".
-                # Use a tiny wrapper so both the probe and normal launches work as root.
-                if sys.platform.startswith("linux"):
-                    try:
-                        if os.geteuid() == 0:
-                            wrapper = Path("/tmp/ticketswap_chrome_wrapper_no_sandbox.sh")
-                            wrapper.write_text(
-                                "#!/usr/bin/env bash\n"
-                                "exec /opt/google/chrome/chrome --no-sandbox --disable-setuid-sandbox \"$@\"\n",
-                                encoding="utf-8",
-                            )
-                            os.chmod(wrapper, 0o755)
-                            options.binary_location = str(wrapper)
-                        else:
-                            options.binary_location = str(opt_bin)
-                    except Exception:
-                        options.binary_location = str(opt_bin)
-                else:
-                    options.binary_location = str(opt_bin)
+                options.binary_location = str(opt_bin)
         if resolved_udd:
             options.add_argument(f"--user-data-dir={resolved_udd}")
         # Prefer a system chromedriver when present; Selenium Manager can be unreliable on minimal VPS images.
@@ -492,6 +478,8 @@ def new_driver(
             candidates: list[str] = []
             if drv_override:
                 candidates.append(drv_override)
+            # Install via Chrome-for-Testing zip (see scripts/vps_manual_inspection/install_chromedriver_cft.sh).
+            candidates.append("/usr/local/bin/chromedriver-cft")
             # Ubuntu's chromium-chromedriver package installs a binary here; /usr/bin/chromedriver
             # may be a wrapper.
             candidates.append("/usr/lib/chromium-browser/chromedriver")

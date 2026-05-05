@@ -3,7 +3,10 @@
 # Designed to be invoked from an interactive ssh session and then forgotten.
 set -euo pipefail
 
-cd /root/festival-ticket-model
+# Prefer plain Selenium on VPS where undetected-chromedriver is unstable / segfault-prone.
+export TICKETSWAP_DRIVER_IMPL="${TICKETSWAP_DRIVER_IMPL:-selenium}"
+
+cd "${FESTIVAL_TICKET_REPO:-/root/festival-ticket-model}"
 
 mkdir -p logs/archive
 ts=$(date -u +%Y%m%dT%H%M%SZ)
