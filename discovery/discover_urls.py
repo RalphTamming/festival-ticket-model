@@ -29,6 +29,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import sys
 import time
 import unicodedata
