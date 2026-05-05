@@ -444,6 +444,7 @@ def new_driver(
     if impl == "selenium":
         log.warning("[Chrome] using selenium webdriver implementation")
         from selenium import webdriver  # local import: allow VPS to bypass UC entirely
+        from selenium.webdriver.chrome.service import Service
         from selenium.webdriver.chrome.options import Options
 
         options = Options()
@@ -459,6 +460,11 @@ def new_driver(
                 options.binary_location = str(opt_bin)
         if resolved_udd:
             options.add_argument(f"--user-data-dir={resolved_udd}")
+        # Prefer a system chromedriver when present; Selenium Manager can be unreliable on minimal VPS images.
+        drv_override = str(os.getenv("TICKETSWAP_CHROMEDRIVER_PATH", "") or "").strip()
+        drv_path = drv_override or (shutil.which("chromedriver") or "")
+        if drv_path:
+            return webdriver.Chrome(service=Service(executable_path=drv_path), options=options)
         # Selenium 4.6+ uses Selenium Manager when no driver path is specified.
         return webdriver.Chrome(options=options)
 
