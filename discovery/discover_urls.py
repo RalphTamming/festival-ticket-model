@@ -364,6 +364,20 @@ def run_step2_interaction_rounds(driver, *, max_rounds: Optional[int] = None) ->
         scroll_for_lazy_content(driver)
 
 
+def _unlink_stale_chrome_singleton_artifacts(profile_root: Path, log: logging.Logger) -> None:
+    """Remove stale Singleton* links left after Chrome/chromedriver crashes (blocks new sessions)."""
+    if not profile_root.is_dir():
+        return
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        path = profile_root / name
+        try:
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+                log.debug("removed stale chrome singleton artifact %s", path)
+        except OSError as exc:
+            log.debug("could not remove %s: %s", path, exc)
+
+
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
@@ -448,8 +462,12 @@ def new_driver(
         from selenium.webdriver.chrome.service import Service
         from selenium.webdriver.chrome.options import Options
 
+        if resolved_udd:
+            _unlink_stale_chrome_singleton_artifacts(Path(resolved_udd).resolve(), log)
+
         options = Options()
         _common_options(options, use_prof=use_prof)
+        options.add_argument("--remote-allow-origins=*")
         # Headed Chrome on VPS commonly needs these even for non-root automation users.
         if sys.platform.startswith("linux"):
             options.add_argument("--no-sandbox")
