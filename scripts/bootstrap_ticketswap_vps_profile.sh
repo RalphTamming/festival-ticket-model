@@ -36,6 +36,12 @@ fi
 : "${TICKETSWAP_PROFILE_DIR:?Set TICKETSWAP_PROFILE_DIR to your Chrome user-data-dir}"
 export TICKETSWAP_HEADLESS="${TICKETSWAP_HEADLESS:-0}"
 
+# VPS: pinned ChromeDriver is usually /usr/local/bin/chromedriver-cft — prefer Selenium over UC unless overridden.
+if [[ -z "${TICKETSWAP_DRIVER_IMPL:-}" ]] && [[ -x /usr/local/bin/chromedriver-cft ]]; then
+  export TICKETSWAP_DRIVER_IMPL=selenium
+  export TICKETSWAP_CHROMEDRIVER_PATH="${TICKETSWAP_CHROMEDRIVER_PATH:-/usr/local/bin/chromedriver-cft}"
+fi
+
 echo "Opening headed Chrome with profile: $TICKETSWAP_PROFILE_DIR"
 echo "Complete login or verification manually (VNC/noVNC/ssh -X as needed)."
 echo "This script does not read or store passwords — only the Chrome profile on disk is updated."
