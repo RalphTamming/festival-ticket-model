@@ -352,6 +352,18 @@ def looks_like_verification(html: str) -> bool:
     )
 
 
+def _unlink_stale_chrome_singleton_artifacts(profile_root: Path) -> None:
+    if not profile_root.is_dir():
+        return
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        p = profile_root / name
+        try:
+            if p.is_symlink() or p.is_file():
+                p.unlink()
+        except OSError:
+            pass
+
+
 def new_driver(*, headless: bool) -> Any:
     impl_raw = str(os.getenv("TICKETSWAP_DRIVER_IMPL", "") or "").strip().lower()
     drv_hint = str(os.getenv("TICKETSWAP_CHROMEDRIVER_PATH", "") or "").strip()
@@ -388,8 +400,9 @@ def new_driver(*, headless: bool) -> Any:
             if opt_bin.is_file():
                 options.binary_location = str(opt_bin)
 
-        profile_root = str(config.ticketswap_profile_directory())
-        options.add_argument(f"--user-data-dir={profile_root}")
+        profile_root = Path(str(config.ticketswap_profile_directory()))
+        _unlink_stale_chrome_singleton_artifacts(profile_root)
+        options.add_argument(f"--user-data-dir={str(profile_root)}")
 
         drv_override = str(os.getenv("TICKETSWAP_CHROMEDRIVER_PATH", "") or "").strip()
         candidates: list[str] = []
