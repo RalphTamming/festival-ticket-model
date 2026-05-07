@@ -17,8 +17,11 @@ import argparse
 import contextlib
 import json
 import logging
+import os
 import re
+import shutil
 import statistics
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -26,7 +29,6 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 from urllib.parse import urljoin, urlparse, urlunparse
 
-import undetected_chromedriver as uc
 from bs4 import BeautifulSoup
 
 import config
@@ -350,7 +352,58 @@ def looks_like_verification(html: str) -> bool:
     )
 
 
-def new_driver(*, headless: bool) -> uc.Chrome:
+def new_driver(*, headless: bool) -> Any:
+    impl = str(os.getenv("TICKETSWAP_DRIVER_IMPL", "uc") or "uc").strip().lower()
+    if impl == "selenium":
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.chrome.service import Service
+
+        options = Options()
+        config.apply_persistent_chrome_profile(options)
+        if headless:
+            options.add_argument("--headless=new")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--disable-infobars")
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
+        options.add_argument("--disable-notifications")
+        options.add_argument("--disable-popup-blocking")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--remote-allow-origins=*")
+        if sys.platform.startswith("linux"):
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-setuid-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+
+        override_bin = str(os.getenv("TICKETSWAP_CHROME_BINARY", "") or "").strip()
+        if override_bin:
+            options.binary_location = override_bin
+        else:
+            opt_bin = Path("/opt/google/chrome/chrome")
+            if opt_bin.is_file():
+                options.binary_location = str(opt_bin)
+
+        profile_root = str(config.ticketswap_profile_directory())
+        options.add_argument(f"--user-data-dir={profile_root}")
+
+        drv_override = str(os.getenv("TICKETSWAP_CHROMEDRIVER_PATH", "") or "").strip()
+        candidates: list[str] = []
+        if drv_override:
+            candidates.append(drv_override)
+        candidates.append("/usr/local/bin/chromedriver-cft")
+        wh = shutil.which("chromedriver")
+        if wh:
+            candidates.append(wh)
+        drv_path = next((p for p in candidates if p and Path(p).is_file()), "")
+        if drv_path:
+            return webdriver.Chrome(service=Service(executable_path=drv_path), options=options)
+        return webdriver.Chrome(options=options)
+
+    # Default: undetected_chromedriver
+    import undetected_chromedriver as uc
+
     options = uc.ChromeOptions()
     config.apply_persistent_chrome_profile(options)
     if headless:

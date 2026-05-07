@@ -335,7 +335,19 @@ run_monitoring() {
   echo "=== MONITORING START $(date -Is) ==="
   local tmp_log
   tmp_log="$(mktemp)"
-  xvfb-run -a python run_pipeline.py --mode monitoring --headed 2>&1 | tee "$tmp_log"
+  # VPS: prefer stable Selenium ChromeDriver (UC is unstable on this VPS).
+  export DISPLAY="${DISPLAY:-:99}"
+  export TICKETSWAP_HEADLESS=0
+  export TICKETSWAP_BROWSER_MODE=headed_vps
+  export TICKETSWAP_DRIVER_IMPL="${TICKETSWAP_DRIVER_IMPL:-selenium}"
+  export TICKETSWAP_CHROMEDRIVER_PATH="${TICKETSWAP_CHROMEDRIVER_PATH:-/usr/local/bin/chromedriver-cft}"
+  export TICKETSWAP_VPS_ENSURE_XVFB="${TICKETSWAP_VPS_ENSURE_XVFB:-1}"
+  if [[ -z "${TICKETSWAP_PROFILE_DIR:-}" ]] && [[ -d "/opt/ticketswap/profile" ]]; then
+    export TICKETSWAP_PROFILE_DIR="/opt/ticketswap/profile"
+  fi
+  bash "$ROOT_DIR/scripts/vps_ensure_xvfb.sh" || true
+
+  python run_pipeline.py --mode monitoring --headed 2>&1 | tee "$tmp_log"
   local rc=${PIPESTATUS[0]}
   local out
   out="$(cat "$tmp_log")"
