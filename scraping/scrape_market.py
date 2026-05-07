@@ -353,7 +353,10 @@ def looks_like_verification(html: str) -> bool:
 
 
 def new_driver(*, headless: bool) -> Any:
-    impl = str(os.getenv("TICKETSWAP_DRIVER_IMPL", "uc") or "uc").strip().lower()
+    impl_raw = str(os.getenv("TICKETSWAP_DRIVER_IMPL", "") or "").strip().lower()
+    drv_hint = str(os.getenv("TICKETSWAP_CHROMEDRIVER_PATH", "") or "").strip()
+    # Monitoring runs in many environments; treat an explicit chromedriver path as intent to use Selenium.
+    impl = impl_raw or ("selenium" if drv_hint else "uc")
     if impl == "selenium":
         from selenium import webdriver
         from selenium.webdriver.chrome.options import Options
